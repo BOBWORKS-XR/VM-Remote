@@ -836,11 +836,27 @@ class VoicemeeterDeckApp:
     def _set_window_icon(self):
         """Set the window/taskbar icon"""
         icon_path = Path(__file__).parent / "icon.png"
+
+        # Set WM_CLASS for Linux taskbar icon matching
+        # This must be done before the window is mapped
+        try:
+            self.root.wm_iconname("VM Remote")
+            # Set the class for window managers to match with .desktop file
+            self.root.tk.call('tk', 'appname', 'voicemeeter-deck')
+        except Exception:
+            pass
+
         if HAS_PIL and icon_path.exists():
             try:
                 img = Image.open(icon_path)
-                self.icon_image = ImageTk.PhotoImage(img)
-                self.root.iconphoto(True, self.icon_image)
+                # Create multiple sizes for better taskbar display
+                self.icon_images = []
+                for size in [16, 32, 48, 64, 128, 256]:
+                    resized = img.resize((size, size), Image.Resampling.LANCZOS)
+                    self.icon_images.append(ImageTk.PhotoImage(resized))
+
+                # Set all icon sizes
+                self.root.iconphoto(True, *self.icon_images)
             except Exception as e:
                 print(f"Error loading icon: {e}")
 
