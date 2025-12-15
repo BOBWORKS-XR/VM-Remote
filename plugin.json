@@ -1,0 +1,11 @@
+{
+  "name": "Voicemeeter Deck",
+  "author": "Your Name",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["audio", "voicemeeter", "vban", "mixer"],
+    "description": "Control Voicemeeter on your PC via VBAN network protocol",
+    "image": "https://i.imgur.com/placeholder.png"
+  }
+}

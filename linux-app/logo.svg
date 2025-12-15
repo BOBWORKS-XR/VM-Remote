@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Transparent background (no rect) -->
+  <!-- Red block -->
+  <rect x="40" y="206" width="170" height="100" rx="10" ry="10" fill="#ff2a2a"/>
+  <!-- VM text -->
+  <text x="125" y="276" text-anchor="middle"
+        font-family="Arial Black, Arial, Helvetica, sans-serif"
+        font-size="64" font-weight="900" fill="#ffffff"
+        letter-spacing="1">VM</text>
+
+  <!-- REMOTE text (slightly smaller + moved left so it won't clip) -->
+  <text x="225" y="276" text-anchor="start"
+        font-family="Arial Black, Arial, Helvetica, sans-serif"
+        font-size="56" font-weight="900" fill="#ffffff"
+        letter-spacing="1">REMOTE</text>
+</svg>

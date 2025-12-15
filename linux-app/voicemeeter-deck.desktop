@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Voicemeeter Deck
+Comment=Control Voicemeeter via VBAN
+Exec=python3 /home/deck/voicemeeter-deck/voicemeeter_deck.py
+Icon=audio-volume-high
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
