@@ -146,12 +146,14 @@ class CustomSlider(tk.Canvas):
         self.on_change = on_change
         self.value = 0
         self.input_blocked = False
+        self.min_height = 120
+        self.base_height = height
 
         # Track
         self.track_x = 25
         self.track_top = 20
         self.track_bottom = height - 20
-        self.create_line(self.track_x, self.track_top, self.track_x, self.track_bottom,
+        self.track_line = self.create_line(self.track_x, self.track_top, self.track_x, self.track_bottom,
                          fill="#555", width=4)
 
         # Handle
@@ -181,6 +183,8 @@ class CustomSlider(tk.Canvas):
         self.bind("<MouseWheel>", self._on_scroll)  # Windows/macOS
         self.bind("<Button-4>", self._on_scroll_up)  # Linux scroll up
         self.bind("<Button-5>", self._on_scroll_down)  # Linux scroll down
+        # Resize support
+        self.bind("<Configure>", self._on_resize)
 
     def _value_to_y(self, value):
         range_val = self.from_val - self.to_val
@@ -268,6 +272,43 @@ class CustomSlider(tk.Canvas):
         if self.on_change:
             self.on_change(new_val)
 
+    def _on_resize(self, event):
+        """Handle resize events"""
+        new_height = event.height
+        if new_height < self.min_height:
+            return
+
+        self.slider_height = new_height
+        self.track_bottom = new_height - 20
+
+        # Update track line
+        self.coords(self.track_line, self.track_x, self.track_top, self.track_x, self.track_bottom)
+
+        # Update handle position
+        self.set_value(self.value)
+
+    def resize(self, new_height, new_width=None):
+        """Manually resize the slider"""
+        if new_height < self.min_height:
+            new_height = self.min_height
+
+        # Calculate width proportionally if not specified
+        if new_width is None:
+            scale = new_height / self.base_height
+            new_width = int(50 * scale)
+            new_width = max(40, min(80, new_width))
+
+        self.config(height=new_height, width=new_width)
+        self.slider_height = new_height
+        self.track_x = new_width // 2
+        self.track_bottom = new_height - 20
+
+        # Scale handle radius
+        self.handle_radius = max(14, min(24, int(18 * (new_height / self.base_height))))
+
+        self.coords(self.track_line, self.track_x, self.track_top, self.track_x, self.track_bottom)
+        self.set_value(self.value)
+
 
 class Knob(tk.Canvas):
     """Rotary knob control - drag up/down to change value, value shown in center"""
@@ -279,20 +320,36 @@ class Knob(tk.Canvas):
         self.on_change = on_change
         self.value = 0 if from_val <= 0 <= to_val else from_val
         self.size = size
+        self.base_size = size
         self.color = color
+        self.label_text = label
         self.dragging = False
         self.drag_start_y = 0
         self.drag_start_value = 0
 
+        self._draw_knob()
+
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        # Scroll wheel support
+        self.bind("<MouseWheel>", self._on_scroll)  # Windows/macOS
+        self.bind("<Button-4>", self._on_scroll_up)  # Linux scroll up
+        self.bind("<Button-5>", self._on_scroll_down)  # Linux scroll down
+
+    def _draw_knob(self):
+        """Draw or redraw the knob at current size"""
+        self.delete("all")
+        size = self.size
         center_x = size // 2
         center_y = size // 2
 
-        # Label above knob
-        self.create_text(center_x, size + 6, text=label, fill="#888", font=("", 7, "bold"))
+        # Label below knob
+        self.label_item = self.create_text(center_x, size + 6, text=self.label_text, fill="#888", font=("", 7, "bold"))
 
         # Outer ring (dark)
         ring_radius = size // 2 - 4
-        self.create_oval(
+        self.outer_ring = self.create_oval(
             center_x - ring_radius, center_y - ring_radius,
             center_x + ring_radius, center_y + ring_radius,
             fill="#333", outline="#555", width=2
@@ -306,29 +363,22 @@ class Knob(tk.Canvas):
             fill="#222", outline=""
         )
 
-        # Value text in center
+        # Value text in center - scale font with size
+        font_size = max(8, size // 5)
         self.value_text = self.create_text(
             center_x, center_y,
             text=str(self.value),
-            fill=color,
-            font=("", 10, "bold")
+            fill=self.color,
+            font=("", font_size, "bold")
         )
 
         # Indicator line (shows position)
         self.indicator = self.create_line(
             center_x, center_y - inner_radius + 2,
             center_x, center_y - ring_radius + 2,
-            fill=color, width=3
+            fill=self.color, width=3
         )
         self._update_indicator()
-
-        self.bind("<Button-1>", self._on_click)
-        self.bind("<B1-Motion>", self._on_drag)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        # Scroll wheel support
-        self.bind("<MouseWheel>", self._on_scroll)  # Windows/macOS
-        self.bind("<Button-4>", self._on_scroll_up)  # Linux scroll up
-        self.bind("<Button-5>", self._on_scroll_down)  # Linux scroll down
 
     def _on_click(self, event):
         self.dragging = True
@@ -414,6 +464,14 @@ class Knob(tk.Canvas):
         self.value = value
         self._update_display()
 
+    def resize(self, new_size):
+        """Resize the knob"""
+        if new_size < 30:
+            new_size = 30
+        self.size = new_size
+        self.config(width=new_size, height=new_size + 12)
+        self._draw_knob()
+
 
 class RoutingButton(tk.Button):
     """Small routing button (A1, A2, B1, etc.)"""
@@ -470,6 +528,7 @@ class ChannelStrip(tk.Frame):
         self.is_strip = is_strip
         self.show_gate = show_gate
         self.show_eq = show_eq
+        self.label_text = label
 
         state = initial_state or {}
         self.muted = state.get("muted", False)
@@ -631,6 +690,25 @@ class ChannelStrip(tk.Frame):
             state["eq_treble"] = self.eq_treble.value
         return state
 
+    def scale(self, scale_factor):
+        """Scale the channel strip components"""
+        # Scale slider height
+        base_slider_height = 150 if (self.show_gate or self.show_eq) else 180
+        new_height = int(base_slider_height * scale_factor)
+        self.slider.resize(new_height)
+
+        # Scale knobs
+        base_knob_size = 40
+        new_knob_size = int(base_knob_size * scale_factor)
+
+        if self.show_gate:
+            self.gate_knob.resize(new_knob_size)
+
+        if self.show_eq:
+            self.eq_bass.resize(new_knob_size)
+            self.eq_mid.resize(new_knob_size)
+            self.eq_treble.resize(new_knob_size)
+
 
 class TapeRecorder(tk.Frame):
     """Tape recorder control panel matching Voicemeeter layout: <<, >>, |>, [], O"""
@@ -722,6 +800,9 @@ class SettingsDialog(tk.Toplevel):
 class VoicemeeterDeckApp:
     """Main application"""
 
+    BASE_WIDTH = 1050
+    BASE_HEIGHT = 450
+
     def __init__(self):
         self.config = self._load_config()
         self.vban = VBANSender(
@@ -733,9 +814,14 @@ class VoicemeeterDeckApp:
         # Create main window
         self.root = tk.Tk()
         self.root.title("VM Remote")
-        self.root.geometry("1050x450")
-        self.root.minsize(950, 400)  # Minimum window size
+        self.root.geometry(f"{self.BASE_WIDTH}x{self.BASE_HEIGHT}")
+        self.root.minsize(800, 350)  # Minimum window size
         self.root.configure(bg=BG_COLOR)
+
+        # Track last size for resize handling
+        self.last_width = self.BASE_WIDTH
+        self.last_height = self.BASE_HEIGHT
+        self.resize_after_id = None
 
         # Set window icon
         self._set_window_icon()
@@ -743,6 +829,9 @@ class VoicemeeterDeckApp:
         self._create_ui()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Bind resize event
+        self.root.bind("<Configure>", self._on_window_configure)
 
     def _set_window_icon(self):
         """Set the window/taskbar icon"""
@@ -902,6 +991,50 @@ class VoicemeeterDeckApp:
 
     def _open_settings(self):
         SettingsDialog(self.root, self.config, self._save_config)
+
+    def _on_window_configure(self, event):
+        """Handle window resize events"""
+        # Only respond to root window changes
+        if event.widget != self.root:
+            return
+
+        new_width = event.width
+        new_height = event.height
+
+        # Check if size actually changed significantly
+        if abs(new_width - self.last_width) < 10 and abs(new_height - self.last_height) < 10:
+            return
+
+        self.last_width = new_width
+        self.last_height = new_height
+
+        # Debounce resize events - cancel previous scheduled resize
+        if self.resize_after_id:
+            self.root.after_cancel(self.resize_after_id)
+
+        # Schedule the actual resize after a short delay
+        self.resize_after_id = self.root.after(100, self._do_resize)
+
+    def _do_resize(self):
+        """Actually perform the resize scaling"""
+        self.resize_after_id = None
+
+        # Calculate scale factor based on height (primary constraint for mixer UI)
+        height_scale = self.last_height / self.BASE_HEIGHT
+        width_scale = self.last_width / self.BASE_WIDTH
+
+        # Use the smaller scale factor to ensure everything fits
+        scale_factor = min(height_scale, width_scale)
+
+        # Clamp scale factor to reasonable bounds
+        scale_factor = max(0.7, min(2.0, scale_factor))
+
+        # Scale all channel strips
+        for strip in self.strips:
+            strip.scale(scale_factor)
+
+        for bus in self.buses:
+            bus.scale(scale_factor)
 
     def run(self):
         self.root.mainloop()
