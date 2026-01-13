@@ -11,6 +11,8 @@ import struct
 import json
 import threading
 import time
+import sys
+import traceback
 from pathlib import Path
 
 # Try to import PIL for logo support
@@ -27,9 +29,70 @@ VBAN_DATA_FORMAT = 0x10
 VBAN_SERVICE_RTPACKETREGISTER = 32
 VBAN_SERVICE_RTPACKET = 33
 
+# RT packet state bit masks
+VMRTSTATE_MODE_MUTE = 0x00000001
+VMRTSTATE_MODE_BUSA1 = 0x00001000
+VMRTSTATE_MODE_BUSA2 = 0x00002000
+VMRTSTATE_MODE_BUSA3 = 0x00004000
+VMRTSTATE_MODE_BUSA4 = 0x00008000
+VMRTSTATE_MODE_BUSA5 = 0x00080000
+VMRTSTATE_MODE_BUSB1 = 0x00010000
+VMRTSTATE_MODE_BUSB2 = 0x00020000
+VMRTSTATE_MODE_BUSB3 = 0x00040000
+
+ROUTING_STATE_BITS = {
+    "A1": VMRTSTATE_MODE_BUSA1,
+    "A2": VMRTSTATE_MODE_BUSA2,
+    "A3": VMRTSTATE_MODE_BUSA3,
+    "A4": VMRTSTATE_MODE_BUSA4,
+    "A5": VMRTSTATE_MODE_BUSA5,
+    "B1": VMRTSTATE_MODE_BUSB1,
+    "B2": VMRTSTATE_MODE_BUSB2,
+    "B3": VMRTSTATE_MODE_BUSB3,
+}
+
+VM_TYPE_TO_PROFILE = {
+    1: "standard",
+    2: "banana",
+    3: "potato",
+    6: "potato",
+}
+
+MIXER_PROFILES = {
+    "standard": {
+        "strip_labels": ["HW 1", "HW 2", "Virt 1"],
+        "hardware_strips": 2,
+        "bus_labels": ["A", "B"],
+        "routing_buses": [("A1", "A"), ("B1", "B")],
+    },
+    "banana": {
+        "strip_labels": ["HW 1", "HW 2", "HW 3", "Virt 1", "Virt 2"],
+        "hardware_strips": 3,
+        "bus_labels": ["A1", "A2", "A3", "B1", "B2"],
+        "routing_buses": [("A1", "A1"), ("A2", "A2"), ("A3", "A3"), ("B1", "B1"), ("B2", "B2")],
+    },
+    "potato": {
+        "strip_labels": ["HW 1", "HW 2", "HW 3", "HW 4", "HW 5", "Virt 1", "Virt 2", "Virt 3"],
+        "hardware_strips": 5,
+        "bus_labels": ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3"],
+        "routing_buses": [
+            ("A1", "A1"),
+            ("A2", "A2"),
+            ("A3", "A3"),
+            ("A4", "A4"),
+            ("A5", "A5"),
+            ("B1", "B1"),
+            ("B2", "B2"),
+            ("B3", "B3"),
+        ],
+    },
+}
+
 # UI Colors - dark gray theme
 BG_COLOR = "#2d2d2d"  # Main background - lighter black/dark gray
 BG_DARKER = "#252525"  # Slightly darker for contrast
+LOGO_SCALE = 5
+LOGO_MAX_HEIGHT_RATIO = 0.175
 
 CONFIG_FILE = Path.home() / ".config" / "voicemeeter-deck" / "config.json"
 
@@ -37,10 +100,25 @@ DEFAULT_CONFIG = {
     "pc_ip": "192.168.1.212",
     "port": 6980,
     "stream_name": "Command1",
+    "mixer_type": "auto",
     "strips": {},
     "buses": {},
     "recorder": {"play": False, "record": False, "pause": False}
 }
+
+def _log_exception(exc_type, exc_value, exc_traceback):
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_path = CONFIG_FILE.parent / "crash.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"\n[{timestamp}] Unhandled exception\n")
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+    except Exception:
+        pass
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = _log_exception
 
 
 class VBANSender:
@@ -80,20 +158,33 @@ class VBANSender:
     def set_strip_mute(self, index: int, muted: bool):
         self.send_command(f"Strip[{index}].Mute={1 if muted else 0};")
 
+    def set_strip_bus(self, index: int, bus: str, enabled: bool):
+        bus = bus.upper()
+        self.send_command(f"Strip[{index}].{bus}={1 if enabled else 0};")
+
     def set_strip_a1(self, index: int, enabled: bool):
-        self.send_command(f"Strip[{index}].A1={1 if enabled else 0};")
+        self.set_strip_bus(index, "A1", enabled)
 
     def set_strip_a2(self, index: int, enabled: bool):
-        self.send_command(f"Strip[{index}].A2={1 if enabled else 0};")
+        self.set_strip_bus(index, "A2", enabled)
 
     def set_strip_a3(self, index: int, enabled: bool):
-        self.send_command(f"Strip[{index}].A3={1 if enabled else 0};")
+        self.set_strip_bus(index, "A3", enabled)
+
+    def set_strip_a4(self, index: int, enabled: bool):
+        self.set_strip_bus(index, "A4", enabled)
+
+    def set_strip_a5(self, index: int, enabled: bool):
+        self.set_strip_bus(index, "A5", enabled)
 
     def set_strip_b1(self, index: int, enabled: bool):
-        self.send_command(f"Strip[{index}].B1={1 if enabled else 0};")
+        self.set_strip_bus(index, "B1", enabled)
 
     def set_strip_b2(self, index: int, enabled: bool):
-        self.send_command(f"Strip[{index}].B2={1 if enabled else 0};")
+        self.set_strip_bus(index, "B2", enabled)
+
+    def set_strip_b3(self, index: int, enabled: bool):
+        self.set_strip_bus(index, "B3", enabled)
 
     def set_strip_gate(self, index: int, value: float):
         # Gate value 0-10 maps to threshold
@@ -192,6 +283,8 @@ class VBANRTPacketListener:
         # Level data - 34 inputs, 64 outputs (dB * 100)
         self.input_levels = [0] * 34
         self.output_levels = [0] * 64
+        self.strip_states = [0] * 8
+        self.bus_states = [0] * 8
 
     def start(self):
         """Start listening thread"""
@@ -258,9 +351,9 @@ class VBANRTPacketListener:
     def _parse_rt_packet(self, data):
         """Parse RT packet structure"""
         try:
-            if len(data) < 228:  # Minimum size check
+            if len(data) < 212:  # Minimum size check for levels
                 if not hasattr(self, '_warned_size'):
-                    print(f"[RT-Listener] Warning: Packet too small ({len(data)} bytes, need 228+)")
+                    print(f"[RT-Listener] Warning: Packet too small ({len(data)} bytes, need 212+)")
                     self._warned_size = True
                 return
 
@@ -274,12 +367,26 @@ class VBANRTPacketListener:
 
             # Extract output levels: 64 x short (2 bytes each) = 128 bytes
             output_levels = struct.unpack_from("<64h", data, offset)
+            offset += 128
+
+            strip_states = None
+            bus_states = None
+            if len(data) >= offset + 4 + 32 + 32:
+                _ = struct.unpack_from("<I", data, offset)[0]
+                offset += 4
+                strip_states = struct.unpack_from("<8I", data, offset)
+                offset += 32
+                bus_states = struct.unpack_from("<8I", data, offset)
 
             # Update with lock
             with self.lock:
                 self.voicemeeter_type = vm_type
                 self.input_levels = [level * 0.01 for level in input_levels]  # Convert to dB
                 self.output_levels = [level * 0.01 for level in output_levels]
+                if strip_states is not None:
+                    self.strip_states = list(strip_states)
+                if bus_states is not None:
+                    self.bus_states = list(bus_states)
 
             # Debug: Print first 5 input and output levels (once every 50 packets)
             if not hasattr(self, '_debug_counter'):
@@ -306,6 +413,18 @@ class VBANRTPacketListener:
             base, count = self._bus_channel_range(index)
             return self._level_from_range(self.output_levels, base, count)
         return -100.0
+
+    def get_strip_state(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_states):
+                return self.strip_states[index]
+        return None
+
+    def get_bus_state(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.bus_states):
+                return self.bus_states[index]
+        return None
 
     def _strip_channel_range(self, index: int):
         vm_type = self.voicemeeter_type
@@ -768,6 +887,11 @@ class RoutingButton(tk.Button):
         self._update_appearance()
         self.on_toggle(self.is_on)
 
+    def set_state(self, is_on: bool):
+        if self.is_on != is_on:
+            self.is_on = is_on
+            self._update_appearance()
+
     def _update_appearance(self):
         if self.is_on:
             self.config(bg=self.color_on, activebackground=self.color_on_active)
@@ -779,7 +903,7 @@ class ChannelStrip(tk.Frame):
     """A single channel strip with slider, routing buttons, and mute"""
 
     def __init__(self, parent, label: str, index: int, vban: VBANSender, is_strip=True,
-                 initial_state: dict = None, show_gate=False, show_eq=False, rt_listener=None):
+                 initial_state: dict = None, show_gate=False, show_eq=False, rt_listener=None, routing_buses=None):
         super().__init__(parent, bg=BG_COLOR)
         self.index = index
         self.vban = vban
@@ -788,6 +912,7 @@ class ChannelStrip(tk.Frame):
         self.show_eq = show_eq
         self.label_text = label
         self.rt_listener = rt_listener
+        self.routing_buttons = {}
 
         state = initial_state or {}
         self.muted = state.get("muted", False)
@@ -856,8 +981,6 @@ class ChannelStrip(tk.Frame):
             meter_height = 150 if (show_gate or show_eq) else 180
             self.meter = VUMeter(middle, width=8, height=meter_height)
             self.meter.pack(side=tk.LEFT, padx=(5, 2))
-            # Start meter update loop
-            self._update_meter()
 
         # Slider
         self.slider = CustomSlider(
@@ -873,36 +996,22 @@ class ChannelStrip(tk.Frame):
         self.slider.set_value(initial_gain)
 
         # Routing buttons (strips only)
-        if is_strip:
+        if is_strip and routing_buses:
             routing_frame = tk.Frame(middle, bg=BG_COLOR)
             routing_frame.pack(side=tk.LEFT, padx=(2, 5))
 
             idx = self.index
-
-            self.a1_btn = RoutingButton(routing_frame, "A1",
-                                        lambda on, i=idx: vban.set_strip_a1(i, on),
-                                        state.get("a1", True))
-            self.a1_btn.pack(pady=1)
-
-            self.a2_btn = RoutingButton(routing_frame, "A2",
-                                        lambda on, i=idx: vban.set_strip_a2(i, on),
-                                        state.get("a2", False))
-            self.a2_btn.pack(pady=1)
-
-            self.a3_btn = RoutingButton(routing_frame, "A3",
-                                        lambda on, i=idx: vban.set_strip_a3(i, on),
-                                        state.get("a3", False))
-            self.a3_btn.pack(pady=1)
-
-            self.b1_btn = RoutingButton(routing_frame, "B1",
-                                        lambda on, i=idx: vban.set_strip_b1(i, on),
-                                        state.get("b1", False))
-            self.b1_btn.pack(pady=1)
-
-            self.b2_btn = RoutingButton(routing_frame, "B2",
-                                        lambda on, i=idx: vban.set_strip_b2(i, on),
-                                        state.get("b2", False))
-            self.b2_btn.pack(pady=1)
+            for bus_key, label_text in routing_buses:
+                state_key = bus_key.lower()
+                default_on = (bus_key == "A1")
+                btn = RoutingButton(
+                    routing_frame,
+                    label_text,
+                    lambda on, i=idx, b=bus_key: vban.set_strip_bus(i, b, on),
+                    state.get(state_key, default_on)
+                )
+                btn.pack(pady=1)
+                self.routing_buttons[bus_key] = btn
 
         # Mute button
         self.mute_btn = tk.Button(
@@ -918,6 +1027,9 @@ class ChannelStrip(tk.Frame):
             command=self._on_mute_click
         )
         self.mute_btn.pack(pady=(3, 5))
+        # Start meter update loop after all widgets exist
+        if self.meter:
+            self._update_meter()
 
     def _on_gain_change(self, gain):
         if self.is_strip:
@@ -933,15 +1045,43 @@ class ChannelStrip(tk.Frame):
         else:
             self.vban.set_bus_mute(self.index, self.muted)
 
+    def set_mute_state(self, muted: bool):
+        if muted != self.muted:
+            self.muted = muted
+            self._update_mute_appearance()
+
     def _update_mute_appearance(self):
         if self.muted:
             self.mute_btn.config(bg="#d32f2f", activebackground="#b71c1c")
         else:
             self.mute_btn.config(bg="#444", activebackground="#666")
 
+    def _sync_from_rt_state(self):
+        if not self.rt_listener:
+            return
+        if not hasattr(self, "mute_btn"):
+            return
+        if self.is_strip:
+            state = self.rt_listener.get_strip_state(self.index)
+            if state is None:
+                return
+            self.set_mute_state(bool(state & VMRTSTATE_MODE_MUTE))
+            for bus_key, btn in self.routing_buttons.items():
+                bit = ROUTING_STATE_BITS.get(bus_key)
+                if bit is not None:
+                    btn.set_state(bool(state & bit))
+        else:
+            state = self.rt_listener.get_bus_state(self.index)
+            if state is None:
+                return
+            self.set_mute_state(bool(state & VMRTSTATE_MODE_MUTE))
+
     def _update_meter(self):
         """Update VU meter with current level from RT listener"""
+        if not self.winfo_exists():
+            return
         if self.meter and self.rt_listener:
+            self._sync_from_rt_state()
             if self.is_strip:
                 level_db = self.rt_listener.get_input_level(self.index)
             else:
@@ -957,11 +1097,8 @@ class ChannelStrip(tk.Frame):
             "muted": self.muted
         }
         if self.is_strip:
-            state["a1"] = self.a1_btn.is_on
-            state["a2"] = self.a2_btn.is_on
-            state["a3"] = self.a3_btn.is_on
-            state["b1"] = self.b1_btn.is_on
-            state["b2"] = self.b2_btn.is_on
+            for bus_key, btn in self.routing_buttons.items():
+                state[bus_key.lower()] = btn.is_on
         if self.show_gate:
             state["gate"] = self.gate_knob.value
         if self.show_eq:
@@ -1030,7 +1167,7 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.on_save = on_save
         self.title("Settings")
-        self.geometry("400x250")
+        self.geometry("400x310")
         self.resizable(False, False)
         self.configure(bg=BG_COLOR)
 
@@ -1055,6 +1192,18 @@ class SettingsDialog(tk.Toplevel):
         self.stream_entry.insert(0, config["stream_name"])
         self.stream_entry.pack()
 
+        tk.Label(self, text="Mixer Type:", font=("", 12),
+                 bg=BG_COLOR, fg="white").pack(pady=(10, 5))
+        self.mixer_var = tk.StringVar(value=config.get("mixer_type", "banana"))
+        self.mixer_combo = ttk.Combobox(
+            self,
+            textvariable=self.mixer_var,
+            values=["auto", "standard", "banana", "potato"],
+            state="readonly",
+            width=18
+        )
+        self.mixer_combo.pack()
+
         tk.Button(
             self,
             text="Save",
@@ -1071,7 +1220,8 @@ class SettingsDialog(tk.Toplevel):
         config = {
             "pc_ip": self.ip_entry.get(),
             "port": int(self.port_entry.get()),
-            "stream_name": self.stream_entry.get()
+            "stream_name": self.stream_entry.get(),
+            "mixer_type": self.mixer_var.get()
         }
         self.on_save(config)
         self.destroy()
@@ -1085,6 +1235,10 @@ class VoicemeeterDeckApp:
 
     def __init__(self):
         self.config = self._load_config()
+        self.mixer_type_setting = self.config.get("mixer_type", "auto")
+        self.active_mixer_type = self._resolve_mixer_type(self.mixer_type_setting)
+        self.mixer_profile = MIXER_PROFILES[self.active_mixer_type]
+        self.base_width, self.base_height = self._calculate_base_size(self.mixer_profile)
         self.vban = VBANSender(
             self.config["pc_ip"],
             self.config["port"],
@@ -1097,20 +1251,24 @@ class VoicemeeterDeckApp:
 
         # Create main window (need this before starting periodic tasks)
         self.root = tk.Tk()
+        self.root.report_callback_exception = self._report_callback_exception
         self.root.title("VM Remote")
-        self.root.geometry(f"{self.BASE_WIDTH}x{self.BASE_HEIGHT}")
+        self.root.geometry(f"{self.base_width}x{self.base_height}")
         self.root.minsize(800, 350)  # Minimum window size
         self.root.configure(bg=BG_COLOR)
 
         # Track last size for resize handling
-        self.last_width = self.BASE_WIDTH
-        self.last_height = self.BASE_HEIGHT
+        self.last_width = self.base_width
+        self.last_height = self.base_height
         self.resize_after_id = None
 
         # Set window icon
         self._set_window_icon()
 
         self._create_ui()
+
+        if self.mixer_type_setting == "auto":
+            self._auto_detect_mixer_type()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1130,19 +1288,29 @@ class VoicemeeterDeckApp:
         except Exception:
             pass
 
-        if HAS_PIL and icon_path.exists():
-            try:
-                img = Image.open(icon_path)
-                # Create multiple sizes for better taskbar display
-                self.icon_images = []
-                for size in [16, 32, 48, 64, 128, 256]:
-                    resized = img.resize((size, size), Image.Resampling.LANCZOS)
-                    self.icon_images.append(ImageTk.PhotoImage(resized))
+        if icon_path.exists():
+            if HAS_PIL:
+                try:
+                    img = Image.open(icon_path)
+                    # Create multiple sizes for better taskbar display
+                    self.icon_images = []
+                    # Support both old and new Pillow API
+                    resample = getattr(Image, 'LANCZOS', None) or getattr(Image.Resampling, 'LANCZOS', Image.BICUBIC)
+                    for size in [16, 32, 48, 64, 128, 256]:
+                        resized = img.resize((size, size), resample)
+                        self.icon_images.append(ImageTk.PhotoImage(resized))
 
-                # Set all icon sizes
+                    # Set all icon sizes
+                    self.root.iconphoto(True, *self.icon_images)
+                    return
+                except Exception as e:
+                    print(f"Error loading icon: {e}")
+
+            try:
+                self.icon_images = [tk.PhotoImage(file=str(icon_path))]
                 self.root.iconphoto(True, *self.icon_images)
             except Exception as e:
-                print(f"Error loading icon: {e}")
+                print(f"Error loading icon without PIL: {e}")
 
     def _load_config(self) -> dict:
         try:
@@ -1156,8 +1324,12 @@ class VoicemeeterDeckApp:
             print(f"Error loading config: {e}")
         return DEFAULT_CONFIG.copy()
 
+    def _report_callback_exception(self, exc, val, tb):
+        _log_exception(exc, val, tb)
+
     def _save_config(self, config: dict):
         try:
+            previous_type = self.mixer_type_setting
             config["strips"] = self.config.get("strips", {})
             config["buses"] = self.config.get("buses", {})
 
@@ -1170,31 +1342,125 @@ class VoicemeeterDeckApp:
                 config["port"],
                 config["stream_name"]
             )
+            self.mixer_type_setting = config.get("mixer_type", "auto")
+            if self.mixer_type_setting != previous_type:
+                if self.mixer_type_setting == "auto":
+                    self._auto_detect_mixer_type()
+                else:
+                    self._apply_mixer_type(self.mixer_type_setting)
+            self._update_status_label()
             messagebox.showinfo("Settings", "Settings saved!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save: {e}")
 
+    def _resolve_mixer_type(self, mixer_type: str) -> str:
+        if mixer_type == "auto":
+            detected = self._detect_mixer_type()
+            if detected:
+                return detected
+            return "banana"
+        return mixer_type if mixer_type in MIXER_PROFILES else "banana"
+
+    def _detect_mixer_type(self):
+        listener = getattr(self, "rt_listener", None)
+        vm_type = listener.voicemeeter_type if listener else None
+        return VM_TYPE_TO_PROFILE.get(vm_type)
+
+    def _auto_detect_mixer_type(self):
+        detected = self._detect_mixer_type()
+        if detected:
+            if detected != self.active_mixer_type:
+                self._apply_mixer_type(detected)
+            return
+        self.root.after(500, self._auto_detect_mixer_type)
+
+    def _apply_mixer_type(self, mixer_type: str):
+        if mixer_type not in MIXER_PROFILES:
+            return
+        if mixer_type == self.active_mixer_type:
+            return
+        self.active_mixer_type = mixer_type
+        self.mixer_profile = MIXER_PROFILES[self.active_mixer_type]
+        self.base_width, self.base_height = self._calculate_base_size(self.mixer_profile)
+        self.last_width = self.base_width
+        self.last_height = self.base_height
+        self.root.geometry(f"{self.base_width}x{self.base_height}")
+        if hasattr(self, "content"):
+            self._clear_mixer_frames()
+            self._build_mixer_frames()
+        self._update_status_label()
+
+    def _calculate_base_size(self, profile: dict):
+        total_columns = len(profile["strip_labels"]) + len(profile["bus_labels"])
+        base_width = max(800, 200 + (total_columns * 85))
+        return base_width, self.BASE_HEIGHT
+
+    def _update_status_label(self):
+        if not hasattr(self, "status"):
+            return
+        mixer_label = self.active_mixer_type
+        if self.mixer_type_setting == "auto":
+            mixer_label = f"auto -> {self.active_mixer_type}"
+        self.status.config(text=f"Connected to {self.config['pc_ip']}:{self.config['port']} ({mixer_label})")
+
     def _create_ui(self):
         # Header
         header = tk.Frame(self.root, bg=BG_COLOR)
-        header.pack(fill=tk.X, padx=20, pady=10)
+        header.pack(fill=tk.X, padx=20, pady=4)
 
         # Logo - try to load PNG, fall back to text
         self.logo_image = None
         logo_path = Path(__file__).parent / "logo.png"
-        if HAS_PIL and logo_path.exists():
+        logo_label = None
+
+        def _scaled_logo_size(original_width: int, original_height: int):
+            target_width = max(1, int(original_width * LOGO_SCALE))
+            target_height = max(1, int(original_height * LOGO_SCALE))
+            base_height = getattr(self, "base_height", self.BASE_HEIGHT)
+            max_height = int(base_height * LOGO_MAX_HEIGHT_RATIO)
+            if max_height > 0 and target_height > max_height:
+                ratio = max_height / float(target_height)
+                target_width = max(1, int(target_width * ratio))
+                target_height = max_height
+            return target_width, target_height
+
+        if logo_path.exists() and HAS_PIL:
             try:
                 img = Image.open(logo_path)
-                img = img.resize((150, 48), Image.Resampling.LANCZOS)
+                target_width, target_height = _scaled_logo_size(img.width, img.height)
+                # Support both old and new Pillow API
+                resample = getattr(Image, 'LANCZOS', None) or getattr(Image.Resampling, 'LANCZOS', Image.BICUBIC)
+                img = img.resize((target_width, target_height), resample)
                 self.logo_image = ImageTk.PhotoImage(img)
                 logo_label = tk.Label(header, image=self.logo_image, bg=BG_COLOR)
                 logo_label.pack(side=tk.LEFT)
             except Exception as e:
                 print(f"Error loading logo: {e}")
-                title = tk.Label(header, text="VM Remote", font=("", 18, "bold"),
-                                 bg=BG_COLOR, fg="white")
-                title.pack(side=tk.LEFT)
-        else:
+
+        if logo_label is None and logo_path.exists():
+            try:
+                self.logo_image = tk.PhotoImage(file=str(logo_path))
+                width = self.logo_image.width()
+                height = self.logo_image.height()
+                target_width, target_height = _scaled_logo_size(width, height)
+                if width < target_width or height < target_height:
+                    import math
+                    zoom = max(1, math.ceil(target_width / width), math.ceil(target_height / height))
+                    if zoom > 1:
+                        self.logo_image = self.logo_image.zoom(zoom, zoom)
+                        width = self.logo_image.width()
+                        height = self.logo_image.height()
+                if width > target_width or height > target_height:
+                    import math
+                    scale = max(math.ceil(width / target_width), math.ceil(height / target_height))
+                    if scale > 1:
+                        self.logo_image = self.logo_image.subsample(scale, scale)
+                logo_label = tk.Label(header, image=self.logo_image, bg=BG_COLOR)
+                logo_label.pack(side=tk.LEFT)
+            except Exception as e:
+                print(f"Error loading logo without PIL: {e}")
+
+        if logo_label is None:
             title = tk.Label(header, text="VM Remote", font=("", 18, "bold"),
                              bg=BG_COLOR, fg="white")
             title.pack(side=tk.LEFT)
@@ -1216,39 +1482,62 @@ class VoicemeeterDeckApp:
         self.recorder.pack(side=tk.RIGHT, padx=20)
 
         # Content
-        content = tk.Frame(self.root, bg=BG_COLOR)
-        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.content = tk.Frame(self.root, bg=BG_COLOR)
+        self.content.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self._build_mixer_frames()
 
-        # Strips
-        strips_frame = tk.LabelFrame(content, text=" Inputs ", font=("", 10),
-                                     bg=BG_COLOR, fg="white", bd=1)
-        strips_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        # Status
+        self.status = tk.Label(
+            self.root,
+            text="",
+            font=("", 9),
+            bg=BG_COLOR,
+            fg="#888"
+        )
+        self.status.pack(pady=5)
+        self._update_status_label()
 
-        strips_inner = tk.Frame(strips_frame, bg=BG_COLOR)
+    def _clear_mixer_frames(self):
+        if hasattr(self, "strips_frame") and self.strips_frame:
+            self.strips_frame.destroy()
+        if hasattr(self, "buses_frame") and self.buses_frame:
+            self.buses_frame.destroy()
+        self.strips = []
+        self.buses = []
+
+    def _build_mixer_frames(self):
+        profile = self.mixer_profile
+        strip_labels = profile["strip_labels"]
+        routing_buses = profile["routing_buses"]
+        hardware_strips = profile["hardware_strips"]
+
+        self.strips_frame = tk.LabelFrame(self.content, text=" Inputs ", font=("", 10),
+                                          bg=BG_COLOR, fg="white", bd=1)
+        self.strips_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+
+        strips_inner = tk.Frame(self.strips_frame, bg=BG_COLOR)
         strips_inner.pack(pady=5)
 
-        strip_labels = ["HW 1", "HW 2", "HW 3", "Virt 1", "Virt 2"]
         self.strips = []
         for i, label in enumerate(strip_labels):
             strip_state = self.config.get("strips", {}).get(str(i), None)
-            # HW 1-3 (index 0-2) get Gate, Virt 1-2 (index 3-4) get EQ
-            show_gate = (i < 3)
-            show_eq = (i >= 3)
+            # HW strips get Gate, virtual strips get EQ
+            show_gate = (i < hardware_strips)
+            show_eq = (i >= hardware_strips)
             strip = ChannelStrip(strips_inner, label, i, self.vban, is_strip=True,
                                  initial_state=strip_state, show_gate=show_gate, show_eq=show_eq,
-                                 rt_listener=self.rt_listener)
+                                 rt_listener=self.rt_listener, routing_buses=routing_buses)
             strip.pack(side=tk.LEFT, padx=3)
             self.strips.append(strip)
 
-        # Buses
-        buses_frame = tk.LabelFrame(content, text=" Outputs ", font=("", 10),
-                                    bg=BG_COLOR, fg="white", bd=1)
-        buses_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+        self.buses_frame = tk.LabelFrame(self.content, text=" Outputs ", font=("", 10),
+                                         bg=BG_COLOR, fg="white", bd=1)
+        self.buses_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
 
-        buses_inner = tk.Frame(buses_frame, bg=BG_COLOR)
+        buses_inner = tk.Frame(self.buses_frame, bg=BG_COLOR)
         buses_inner.pack(pady=5)
 
-        bus_labels = ["A1", "A2", "A3", "B1", "B2"]
+        bus_labels = profile["bus_labels"]
         self.buses = []
         for i, label in enumerate(bus_labels):
             bus_state = self.config.get("buses", {}).get(str(i), None)
@@ -1256,16 +1545,6 @@ class VoicemeeterDeckApp:
                                initial_state=bus_state, rt_listener=self.rt_listener)
             bus.pack(side=tk.LEFT, padx=3)
             self.buses.append(bus)
-
-        # Status
-        self.status = tk.Label(
-            self.root,
-            text=f"Connected to {self.config['pc_ip']}:{self.config['port']}",
-            font=("", 9),
-            bg=BG_COLOR,
-            fg="#888"
-        )
-        self.status.pack(pady=5)
 
     def _save_channel_states(self):
         strips = {}
@@ -1322,8 +1601,8 @@ class VoicemeeterDeckApp:
         self.resize_after_id = None
 
         # Calculate scale factor based on height (primary constraint for mixer UI)
-        height_scale = self.last_height / self.BASE_HEIGHT
-        width_scale = self.last_width / self.BASE_WIDTH
+        height_scale = self.last_height / self.base_height
+        width_scale = self.last_width / self.base_width
 
         # Use the smaller scale factor to ensure everything fits
         scale_factor = min(height_scale, width_scale)
