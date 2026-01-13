@@ -1,16 +1,18 @@
 import {
-  definePlugin,
+  ButtonItem,
   PanelSection,
   PanelSectionRow,
   SliderField,
   ToggleField,
-  ButtonItem,
   TextField,
   staticClasses,
 } from "@decky/ui";
-import { callable, addEventListener, removeEventListener } from "@decky/api";
-import { useState, useEffect, FC } from "react";
-import { FaMicrophone, FaVolumeUp, FaCog } from "react-icons/fa";
+import {
+  callable,
+  definePlugin,
+} from "@decky/api";
+import { useState, useEffect } from "react";
+import { FaVolumeUp, FaCog } from "react-icons/fa";
 
 // Python backend callables
 const getSettings = callable<[], Settings>("get_settings");
@@ -32,97 +34,7 @@ interface StripState {
   muted: boolean;
 }
 
-const StripControl: FC<{
-  index: number;
-  label: string;
-  state: StripState;
-  onGainChange: (gain: number) => void;
-  onMuteToggle: () => void;
-}> = ({ index, label, state, onGainChange, onMuteToggle }) => {
-  return (
-    <PanelSection title={label}>
-      <PanelSectionRow>
-        <SliderField
-          label="Volume"
-          value={state.gain}
-          min={-60}
-          max={12}
-          step={1}
-          showValue={true}
-          onChange={(value) => onGainChange(value)}
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ToggleField
-          label="Mute"
-          checked={state.muted}
-          onChange={onMuteToggle}
-        />
-      </PanelSectionRow>
-    </PanelSection>
-  );
-};
-
-const SettingsPanel: FC<{
-  settings: Settings;
-  onSave: (settings: Settings) => void;
-  onTest: () => void;
-  connectionStatus: string;
-}> = ({ settings, onSave, onTest, connectionStatus }) => {
-  const [localSettings, setLocalSettings] = useState(settings);
-
-  return (
-    <PanelSection title="VBAN Settings">
-      <PanelSectionRow>
-        <TextField
-          label="PC IP Address"
-          value={localSettings.pc_ip}
-          onChange={(e) =>
-            setLocalSettings({ ...localSettings, pc_ip: e.target.value })
-          }
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <TextField
-          label="VBAN Port"
-          value={String(localSettings.vban_port)}
-          onChange={(e) =>
-            setLocalSettings({
-              ...localSettings,
-              vban_port: parseInt(e.target.value) || 6980,
-            })
-          }
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <TextField
-          label="Stream Name"
-          value={localSettings.stream_name}
-          onChange={(e) =>
-            setLocalSettings({ ...localSettings, stream_name: e.target.value })
-          }
-        />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => onSave(localSettings)}>
-          Save Settings
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onTest}>
-          Test Connection
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <div style={{ textAlign: "center", padding: "8px" }}>
-          Status: {connectionStatus}
-        </div>
-      </PanelSectionRow>
-    </PanelSection>
-  );
-};
-
-const Content: FC = () => {
+function Content() {
   const [showSettings, setShowSettings] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState("Unknown");
   const [settings, setSettings] = useState<Settings>({
@@ -131,26 +43,23 @@ const Content: FC = () => {
     stream_name: "Command1",
   });
 
-  // Strip states (Hardware Inputs) - Voicemeeter Banana has 3 hardware + 2 virtual
   const [strips, setStrips] = useState<StripState[]>([
-    { gain: 0, muted: false }, // Strip 0: Hardware Input 1
-    { gain: 0, muted: false }, // Strip 1: Hardware Input 2
-    { gain: 0, muted: false }, // Strip 2: Hardware Input 3
-    { gain: 0, muted: false }, // Strip 3: Virtual Input 1 (VAIO)
-    { gain: 0, muted: false }, // Strip 4: Virtual Input 2 (AUX)
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
   ]);
 
-  // Bus states (Outputs)
   const [buses, setBuses] = useState<StripState[]>([
-    { gain: 0, muted: false }, // Bus 0: A1
-    { gain: 0, muted: false }, // Bus 1: A2
-    { gain: 0, muted: false }, // Bus 2: A3
-    { gain: 0, muted: false }, // Bus 3: B1
-    { gain: 0, muted: false }, // Bus 4: B2
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
+    { gain: 0, muted: false },
   ]);
 
   useEffect(() => {
-    // Load settings on mount
     getSettings().then(setSettings).catch(console.error);
   }, []);
 
@@ -182,9 +91,8 @@ const Content: FC = () => {
     await toggleBusMute(index);
   };
 
-  const handleSaveSettings = async (newSettings: Settings) => {
-    setSettings(newSettings);
-    await saveSettings(newSettings);
+  const handleSaveSettings = async () => {
+    await saveSettings(settings);
     setConnectionStatus("Settings saved!");
   };
 
@@ -198,18 +106,11 @@ const Content: FC = () => {
     }
   };
 
-  const stripLabels = [
-    "🎤 Hardware 1",
-    "🎤 Hardware 2",
-    "🎤 Hardware 3",
-    "🎵 Virtual 1",
-    "🎵 Virtual 2",
-  ];
-
-  const busLabels = ["🔊 A1", "🔊 A2", "🔊 A3", "🔊 B1", "🔊 B2"];
+  const stripLabels = ["HW 1", "HW 2", "HW 3", "Virt 1", "Virt 2"];
+  const busLabels = ["A1", "A2", "A3", "B1", "B2"];
 
   return (
-    <div>
+    <>
       <PanelSection>
         <PanelSectionRow>
           <ButtonItem
@@ -222,42 +123,98 @@ const Content: FC = () => {
       </PanelSection>
 
       {showSettings && (
-        <SettingsPanel
-          settings={settings}
-          onSave={handleSaveSettings}
-          onTest={handleTestConnection}
-          connectionStatus={connectionStatus}
-        />
+        <PanelSection title="VBAN Settings">
+          <PanelSectionRow>
+            <TextField
+              label="PC IP Address"
+              value={settings.pc_ip}
+              onChange={(e) => setSettings({ ...settings, pc_ip: e.target.value })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <TextField
+              label="VBAN Port"
+              value={String(settings.vban_port)}
+              onChange={(e) => setSettings({ ...settings, vban_port: parseInt(e.target.value) || 6980 })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <TextField
+              label="Stream Name"
+              value={settings.stream_name}
+              onChange={(e) => setSettings({ ...settings, stream_name: e.target.value })}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleSaveSettings}>
+              Save Settings
+            </ButtonItem>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleTestConnection}>
+              Test Connection
+            </ButtonItem>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ textAlign: "center", padding: "8px" }}>
+              Status: {connectionStatus}
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
       )}
 
-      <PanelSection title="Inputs (Strips)">
+      <PanelSection title="Inputs">
         {strips.map((strip, index) => (
-          <StripControl
-            key={`strip-${index}`}
-            index={index}
-            label={stripLabels[index]}
-            state={strip}
-            onGainChange={(gain) => handleStripGainChange(index, gain)}
-            onMuteToggle={() => handleStripMuteToggle(index)}
-          />
+          <PanelSection key={`strip-${index}`} title={stripLabels[index]}>
+            <PanelSectionRow>
+              <SliderField
+                label="Volume"
+                value={strip.gain}
+                min={-60}
+                max={12}
+                step={1}
+                showValue={true}
+                onChange={(value) => handleStripGainChange(index, value)}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ToggleField
+                label="Mute"
+                checked={strip.muted}
+                onChange={() => handleStripMuteToggle(index)}
+              />
+            </PanelSectionRow>
+          </PanelSection>
         ))}
       </PanelSection>
 
-      <PanelSection title="Outputs (Buses)">
+      <PanelSection title="Outputs">
         {buses.map((bus, index) => (
-          <StripControl
-            key={`bus-${index}`}
-            index={index}
-            label={busLabels[index]}
-            state={bus}
-            onGainChange={(gain) => handleBusGainChange(index, gain)}
-            onMuteToggle={() => handleBusMuteToggle(index)}
-          />
+          <PanelSection key={`bus-${index}`} title={busLabels[index]}>
+            <PanelSectionRow>
+              <SliderField
+                label="Volume"
+                value={bus.gain}
+                min={-60}
+                max={12}
+                step={1}
+                showValue={true}
+                onChange={(value) => handleBusGainChange(index, value)}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ToggleField
+                label="Mute"
+                checked={bus.muted}
+                onChange={() => handleBusMuteToggle(index)}
+              />
+            </PanelSectionRow>
+          </PanelSection>
         ))}
       </PanelSection>
-    </div>
+    </>
   );
-};
+}
 
 export default definePlugin(() => {
   console.log("Voicemeeter Deck plugin loaded!");

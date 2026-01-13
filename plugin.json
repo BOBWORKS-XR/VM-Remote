@@ -1,8 +1,8 @@
 {
   "name": "Voicemeeter Deck",
-  "author": "Your Name",
+  "author": "BOBWORKS-XR",
   "flags": ["root"],
-  "api_version": 1,
+  "api_version": 2,
   "publish": {
     "tags": ["audio", "voicemeeter", "vban", "mixer"],
     "description": "Control Voicemeeter on your PC via VBAN network protocol",

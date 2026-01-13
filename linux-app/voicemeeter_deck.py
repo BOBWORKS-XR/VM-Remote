@@ -139,27 +139,42 @@ class VBANSender:
     def recorder_goto_start(self):
         self.send_command("Recorder.GoTo=0;")
 
-    def register_rt_packet(self, listen_port: int, timeout: int = 10):
-        """Register for RT-Packet updates"""
+    def register_rt_packet(self, timeout: int = 15, stream_name: str = "VMDeckLinux", source_socket=None):
+        """Register for RT-Packet updates (must be called periodically every ~10s).
+
+        Pass the listener socket so Voicemeeter replies to the correct UDP port.
+        """
         try:
             header = bytearray(28)
             header[0:4] = b"VBAN"
-            header[4] = VBAN_PROTOCOL_SERVICE
+            # format_SR (byte 4): Contains protocol (0x60) + sample rate bits
+            header[4] = VBAN_PROTOCOL_SERVICE  # 0x60
+            # format_nbs (byte 5): Number of samples (0 for service packets)
             header[5] = 0
-            header[6] = 0
-            header[7] = VBAN_SERVICE_RTPACKETREGISTER
-            stream_bytes = self.stream_name.encode("utf-8")[:16]
+            # format_nbc (byte 6): Number of channels minus 1, OR in service context: service type
+            header[6] = VBAN_SERVICE_RTPACKETREGISTER  # 32
+            # format_bit (byte 7): Bit depth (audio) OR timeout (service packets)
+            header[7] = timeout & 0xFF
+
+            # Stream name for registration - 16 bytes max
+            if isinstance(stream_name, bytes):
+                stream_bytes = stream_name[:16]
+            else:
+                stream_bytes = stream_name.encode("utf-8")[:16]
             header[8:8 + len(stream_bytes)] = stream_bytes
+
+            # Frame counter
             header[24:28] = struct.pack("<I", self.frame_counter)
             self.frame_counter = (self.frame_counter + 1) % 0xFFFFFFFF
 
-            # Add timeout and port info
-            data = struct.pack("<BH", timeout, listen_port)
-            packet = bytes(header) + data
-            self.socket.sendto(packet, (self.ip, self.port))
+            # Send just the 28-byte header - no additional data
+            packet = bytes(header)
+            send_socket = source_socket or self.socket
+            send_socket.sendto(packet, (self.ip, self.port))
+            print(f"[VBAN] Sent RT-Packet registration (timeout={timeout}s)")
             return True
         except Exception as e:
-            print(f"Error registering RT packet: {e}")
+            print(f"[VBAN] Error registering RT packet: {e}")
             return False
 
 
@@ -172,6 +187,7 @@ class VBANRTPacketListener:
         self.thread = None
         self.running = False
         self.lock = threading.Lock()
+        self.voicemeeter_type = None
 
         # Level data - 34 inputs, 64 outputs (dB * 100)
         self.input_levels = [0] * 34
@@ -191,9 +207,10 @@ class VBANRTPacketListener:
             self.running = True
             self.thread = threading.Thread(target=self._listen_thread, daemon=True)
             self.thread.start()
+            print(f"[RT-Listener] Started listening on port {self.port}")
             return True
         except Exception as e:
-            print(f"Error starting RT listener: {e}")
+            print(f"[RT-Listener] Error starting: {e}")
             return False
 
     def stop(self):
@@ -206,30 +223,49 @@ class VBANRTPacketListener:
 
     def _listen_thread(self):
         """Background thread to receive RT packets"""
+        packet_count = 0
+        print("[RT-Listener] Thread started, waiting for packets...")
+
         while self.running:
             try:
                 data, addr = self.socket.recvfrom(2048)
+                packet_count += 1
+
+                # Debug first packet received
+                if packet_count == 1:
+                    print(f"[RT-Listener] First packet received from {addr}, length={len(data)}")
+
                 if len(data) >= 28:
                     # Check VBAN header
                     if data[0:4] == b"VBAN":
                         protocol = data[4] & 0xE0
-                        service_type = data[7]
+                        service_type = data[6]
 
                         if protocol == VBAN_PROTOCOL_SERVICE and service_type == VBAN_SERVICE_RTPACKET:
+                            if packet_count == 1:
+                                print(f"[RT-Listener] First RT packet validated! Protocol={hex(protocol)}, Service={service_type}")
                             self._parse_rt_packet(data[28:])  # Skip 28-byte header
+                        elif packet_count <= 3:
+                            print(f"[RT-Listener] Packet {packet_count}: Wrong type - protocol={hex(protocol)}, service={service_type}")
+                    elif packet_count <= 3:
+                        print(f"[RT-Listener] Packet {packet_count}: Not VBAN - header={data[0:4]}")
             except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
-                    print(f"Error in RT listener: {e}")
+                    print(f"[RT-Listener] Error: {e}")
 
     def _parse_rt_packet(self, data):
         """Parse RT packet structure"""
         try:
             if len(data) < 228:  # Minimum size check
+                if not hasattr(self, '_warned_size'):
+                    print(f"[RT-Listener] Warning: Packet too small ({len(data)} bytes, need 228+)")
+                    self._warned_size = True
                 return
 
             # Skip first 16 bytes (voicemeeterType, reserved, buffersize, version, optionBits, samplerate)
+            vm_type = data[0]
             offset = 16
 
             # Extract input levels: 34 x short (2 bytes each) = 68 bytes
@@ -241,8 +277,18 @@ class VBANRTPacketListener:
 
             # Update with lock
             with self.lock:
+                self.voicemeeter_type = vm_type
                 self.input_levels = [level * 0.01 for level in input_levels]  # Convert to dB
                 self.output_levels = [level * 0.01 for level in output_levels]
+
+            # Debug: Print first 5 input and output levels (once every 50 packets)
+            if not hasattr(self, '_debug_counter'):
+                self._debug_counter = 0
+                print(f"[RT-Listener] First packet parsed successfully!")
+            self._debug_counter += 1
+            if self._debug_counter % 50 == 0:
+                print(f"[RT-Listener] Input[0-4]: {[f'{l:.1f}dB' for l in self.input_levels[:5]]}")
+                print(f"[RT-Listener] Output[0-4]: {[f'{l:.1f}dB' for l in self.output_levels[:5]]}")
 
         except Exception as e:
             print(f"Error parsing RT packet: {e}")
@@ -250,16 +296,44 @@ class VBANRTPacketListener:
     def get_input_level(self, index: int) -> float:
         """Get input level in dB for given strip index"""
         with self.lock:
-            if 0 <= index < len(self.input_levels):
-                return self.input_levels[index]
+            base, count = self._strip_channel_range(index)
+            return self._level_from_range(self.input_levels, base, count)
         return -100.0
 
     def get_output_level(self, index: int) -> float:
         """Get output level in dB for given bus index"""
         with self.lock:
-            if 0 <= index < len(self.output_levels):
-                return self.output_levels[index]
+            base, count = self._bus_channel_range(index)
+            return self._level_from_range(self.output_levels, base, count)
         return -100.0
+
+    def _strip_channel_range(self, index: int):
+        vm_type = self.voicemeeter_type
+        if vm_type == 1:
+            if index < 2:
+                return index * 2, 2
+            return 4 + (index - 2) * 8, 8
+        if vm_type == 2:
+            if index < 3:
+                return index * 2, 2
+            return 6 + (index - 3) * 8, 8
+        if vm_type in (3, 6):
+            if index < 5:
+                return index * 2, 2
+            return 10 + (index - 5) * 8, 8
+        return index * 2, 2
+
+    def _bus_channel_range(self, index: int):
+        return index * 8, 8
+
+    @staticmethod
+    def _level_from_range(levels, base, count):
+        if base < 0 or base >= len(levels):
+            return -100.0
+        end = min(base + count, len(levels))
+        if end <= base:
+            return -100.0
+        return max(levels[base:end])
 
 
 class CustomSlider(tk.Canvas):
@@ -1020,10 +1094,8 @@ class VoicemeeterDeckApp:
         # RT Packet Listener for level meters
         self.rt_listener = VBANRTPacketListener(port=6990)
         self.rt_listener.start()
-        # Register for RT packets from Voicemeeter
-        self.vban.register_rt_packet(listen_port=6990, timeout=10)
 
-        # Create main window
+        # Create main window (need this before starting periodic tasks)
         self.root = tk.Tk()
         self.root.title("VM Remote")
         self.root.geometry(f"{self.BASE_WIDTH}x{self.BASE_HEIGHT}")
@@ -1266,7 +1338,18 @@ class VoicemeeterDeckApp:
         for bus in self.buses:
             bus.scale(scale_factor)
 
+    def _periodic_rt_registration(self):
+        """Re-register for RT packets every 10 seconds (as per SDK sample)"""
+        try:
+            self.vban.register_rt_packet(timeout=15, source_socket=self.rt_listener.socket)
+        except Exception as e:
+            print(f"Error in periodic RT registration: {e}")
+        # Schedule next registration in 10 seconds (10000ms)
+        self.root.after(10000, self._periodic_rt_registration)
+
     def run(self):
+        # Start periodic RT packet registration
+        self._periodic_rt_registration()
         self.root.mainloop()
 
 
