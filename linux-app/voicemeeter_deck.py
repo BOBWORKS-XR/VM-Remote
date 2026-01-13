@@ -9,6 +9,8 @@ from tkinter import ttk, messagebox
 import socket
 import struct
 import json
+import threading
+import time
 from pathlib import Path
 
 # Try to import PIL for logo support
@@ -20,7 +22,10 @@ except ImportError:
 
 # VBAN Protocol Constants
 VBAN_PROTOCOL_TXT = 0x40
+VBAN_PROTOCOL_SERVICE = 0x60
 VBAN_DATA_FORMAT = 0x10
+VBAN_SERVICE_RTPACKETREGISTER = 32
+VBAN_SERVICE_RTPACKET = 33
 
 # UI Colors - dark gray theme
 BG_COLOR = "#2d2d2d"  # Main background - lighter black/dark gray
@@ -133,6 +138,128 @@ class VBANSender:
 
     def recorder_goto_start(self):
         self.send_command("Recorder.GoTo=0;")
+
+    def register_rt_packet(self, listen_port: int, timeout: int = 10):
+        """Register for RT-Packet updates"""
+        try:
+            header = bytearray(28)
+            header[0:4] = b"VBAN"
+            header[4] = VBAN_PROTOCOL_SERVICE
+            header[5] = 0
+            header[6] = 0
+            header[7] = VBAN_SERVICE_RTPACKETREGISTER
+            stream_bytes = self.stream_name.encode("utf-8")[:16]
+            header[8:8 + len(stream_bytes)] = stream_bytes
+            header[24:28] = struct.pack("<I", self.frame_counter)
+            self.frame_counter = (self.frame_counter + 1) % 0xFFFFFFFF
+
+            # Add timeout and port info
+            data = struct.pack("<BH", timeout, listen_port)
+            packet = bytes(header) + data
+            self.socket.sendto(packet, (self.ip, self.port))
+            return True
+        except Exception as e:
+            print(f"Error registering RT packet: {e}")
+            return False
+
+
+class VBANRTPacketListener:
+    """Listen for VBAN RT-Packets containing level meters"""
+
+    def __init__(self, port: int = 6990):
+        self.port = port
+        self.socket = None
+        self.thread = None
+        self.running = False
+        self.lock = threading.Lock()
+
+        # Level data - 34 inputs, 64 outputs (dB * 100)
+        self.input_levels = [0] * 34
+        self.output_levels = [0] * 64
+
+    def start(self):
+        """Start listening thread"""
+        if self.running:
+            return
+
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(('', self.port))
+            self.socket.settimeout(0.1)  # 100ms timeout for clean shutdown
+
+            self.running = True
+            self.thread = threading.Thread(target=self._listen_thread, daemon=True)
+            self.thread.start()
+            return True
+        except Exception as e:
+            print(f"Error starting RT listener: {e}")
+            return False
+
+    def stop(self):
+        """Stop listening thread"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.socket:
+            self.socket.close()
+
+    def _listen_thread(self):
+        """Background thread to receive RT packets"""
+        while self.running:
+            try:
+                data, addr = self.socket.recvfrom(2048)
+                if len(data) >= 28:
+                    # Check VBAN header
+                    if data[0:4] == b"VBAN":
+                        protocol = data[4] & 0xE0
+                        service_type = data[7]
+
+                        if protocol == VBAN_PROTOCOL_SERVICE and service_type == VBAN_SERVICE_RTPACKET:
+                            self._parse_rt_packet(data[28:])  # Skip 28-byte header
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Error in RT listener: {e}")
+
+    def _parse_rt_packet(self, data):
+        """Parse RT packet structure"""
+        try:
+            if len(data) < 228:  # Minimum size check
+                return
+
+            # Skip first 16 bytes (voicemeeterType, reserved, buffersize, version, optionBits, samplerate)
+            offset = 16
+
+            # Extract input levels: 34 x short (2 bytes each) = 68 bytes
+            input_levels = struct.unpack_from("<34h", data, offset)
+            offset += 68
+
+            # Extract output levels: 64 x short (2 bytes each) = 128 bytes
+            output_levels = struct.unpack_from("<64h", data, offset)
+
+            # Update with lock
+            with self.lock:
+                self.input_levels = [level * 0.01 for level in input_levels]  # Convert to dB
+                self.output_levels = [level * 0.01 for level in output_levels]
+
+        except Exception as e:
+            print(f"Error parsing RT packet: {e}")
+
+    def get_input_level(self, index: int) -> float:
+        """Get input level in dB for given strip index"""
+        with self.lock:
+            if 0 <= index < len(self.input_levels):
+                return self.input_levels[index]
+        return -100.0
+
+    def get_output_level(self, index: int) -> float:
+        """Get output level in dB for given bus index"""
+        with self.lock:
+            if 0 <= index < len(self.output_levels):
+                return self.output_levels[index]
+        return -100.0
 
 
 class CustomSlider(tk.Canvas):
@@ -308,6 +435,63 @@ class CustomSlider(tk.Canvas):
 
         self.coords(self.track_line, self.track_x, self.track_top, self.track_x, self.track_bottom)
         self.set_value(self.value)
+
+
+class VUMeter(tk.Canvas):
+    """Vertical VU meter showing audio levels"""
+
+    def __init__(self, parent, width=8, height=150):
+        super().__init__(parent, width=width, height=height, bg=BG_DARKER, highlightthickness=0)
+        self.meter_width = width
+        self.meter_height = height
+        self.level_db = -60.0  # Current level in dB
+
+        # Create meter bar (will be updated with level)
+        self.meter_bar = self.create_rectangle(
+            0, height,
+            width, height,
+            fill="#00ff00",
+            outline=""
+        )
+
+        # Start update loop
+        self._update_display()
+
+    def set_level(self, db_value: float):
+        """Set the meter level in dB (-60 to +12)"""
+        self.level_db = max(-60.0, min(12.0, db_value))
+
+    def _update_display(self):
+        """Update the visual display"""
+        # Map dB to height (logarithmic scale)
+        # -60dB = 0%, 0dB = ~70%, +12dB = 100%
+        if self.level_db <= -60:
+            percent = 0
+        else:
+            # Simplified mapping: -60dB to 0dB is 0-70%, 0dB to +12dB is 70-100%
+            if self.level_db <= 0:
+                percent = ((self.level_db + 60) / 60) * 0.7
+            else:
+                percent = 0.7 + (self.level_db / 12) * 0.3
+
+        bar_height = int(self.meter_height * percent)
+        bar_y = self.meter_height - bar_height
+
+        # Color based on level
+        if self.level_db > 6:
+            color = "#ff0000"  # Red - too hot
+        elif self.level_db > 0:
+            color = "#ffaa00"  # Orange - getting hot
+        elif self.level_db > -20:
+            color = "#00ff00"  # Green - good
+        else:
+            color = "#004400"  # Dark green - quiet
+
+        self.coords(self.meter_bar, 0, bar_y, self.meter_width, self.meter_height)
+        self.itemconfig(self.meter_bar, fill=color)
+
+        # Schedule next update
+        self.after(50, self._update_display)  # 20 FPS
 
 
 class Knob(tk.Canvas):
@@ -521,7 +705,7 @@ class ChannelStrip(tk.Frame):
     """A single channel strip with slider, routing buttons, and mute"""
 
     def __init__(self, parent, label: str, index: int, vban: VBANSender, is_strip=True,
-                 initial_state: dict = None, show_gate=False, show_eq=False):
+                 initial_state: dict = None, show_gate=False, show_eq=False, rt_listener=None):
         super().__init__(parent, bg=BG_COLOR)
         self.index = index
         self.vban = vban
@@ -529,6 +713,7 @@ class ChannelStrip(tk.Frame):
         self.show_gate = show_gate
         self.show_eq = show_eq
         self.label_text = label
+        self.rt_listener = rt_listener
 
         state = initial_state or {}
         self.muted = state.get("muted", False)
@@ -590,6 +775,15 @@ class ChannelStrip(tk.Frame):
         # Middle section
         middle = tk.Frame(self, bg=BG_COLOR)
         middle.pack(fill=tk.BOTH, expand=True)
+
+        # VU Meter (if RT listener provided)
+        self.meter = None
+        if rt_listener:
+            meter_height = 150 if (show_gate or show_eq) else 180
+            self.meter = VUMeter(middle, width=8, height=meter_height)
+            self.meter.pack(side=tk.LEFT, padx=(5, 2))
+            # Start meter update loop
+            self._update_meter()
 
         # Slider
         self.slider = CustomSlider(
@@ -670,6 +864,18 @@ class ChannelStrip(tk.Frame):
             self.mute_btn.config(bg="#d32f2f", activebackground="#b71c1c")
         else:
             self.mute_btn.config(bg="#444", activebackground="#666")
+
+    def _update_meter(self):
+        """Update VU meter with current level from RT listener"""
+        if self.meter and self.rt_listener:
+            if self.is_strip:
+                level_db = self.rt_listener.get_input_level(self.index)
+            else:
+                level_db = self.rt_listener.get_output_level(self.index)
+            self.meter.set_level(level_db)
+        # Schedule next update
+        if self.meter:
+            self.after(50, self._update_meter)  # 20 FPS
 
     def get_state(self) -> dict:
         state = {
@@ -811,6 +1017,12 @@ class VoicemeeterDeckApp:
             self.config["stream_name"]
         )
 
+        # RT Packet Listener for level meters
+        self.rt_listener = VBANRTPacketListener(port=6990)
+        self.rt_listener.start()
+        # Register for RT packets from Voicemeeter
+        self.vban.register_rt_packet(listen_port=6990, timeout=10)
+
         # Create main window
         self.root = tk.Tk()
         self.root.title("VM Remote")
@@ -951,7 +1163,8 @@ class VoicemeeterDeckApp:
             show_gate = (i < 3)
             show_eq = (i >= 3)
             strip = ChannelStrip(strips_inner, label, i, self.vban, is_strip=True,
-                                 initial_state=strip_state, show_gate=show_gate, show_eq=show_eq)
+                                 initial_state=strip_state, show_gate=show_gate, show_eq=show_eq,
+                                 rt_listener=self.rt_listener)
             strip.pack(side=tk.LEFT, padx=3)
             self.strips.append(strip)
 
@@ -968,7 +1181,7 @@ class VoicemeeterDeckApp:
         for i, label in enumerate(bus_labels):
             bus_state = self.config.get("buses", {}).get(str(i), None)
             bus = ChannelStrip(buses_inner, label, i, self.vban, is_strip=False,
-                               initial_state=bus_state)
+                               initial_state=bus_state, rt_listener=self.rt_listener)
             bus.pack(side=tk.LEFT, padx=3)
             self.buses.append(bus)
 
@@ -1003,6 +1216,7 @@ class VoicemeeterDeckApp:
 
     def _on_close(self):
         self._save_channel_states()
+        self.rt_listener.stop()
         self.root.destroy()
 
     def _open_settings(self):
