@@ -5,7 +5,7 @@ Control Voicemeeter from your Steam Deck or Linux device via VBAN protocol.
 A lightweight Python/Tkinter application that lets you remotely control Voicemeeter Banana/Potato from your Steam Deck in Desktop Mode. Adjust gain, mute channels, control routing (A1-A3, B1-B2), tweak EQ and Gate settings, and operate the tape recorder - all over your local network using VBAN text commands.
 <img width="1047" height="476" alt="image" src="https://github.com/user-attachments/assets/8358c79e-8cc6-4a70-ac03-f0511b615e43" />
 
-![VM Remote Screenshot](linux-app/screenshot.png)
+
 
 ## Features
 
