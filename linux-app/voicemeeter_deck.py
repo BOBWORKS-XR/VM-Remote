@@ -5,10 +5,11 @@ Control Voicemeeter via VBAN from your Steam Deck
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import socket
 import struct
 import json
+import os
 import threading
 import time
 import sys
@@ -29,6 +30,9 @@ VBAN_DATA_FORMAT = 0x10
 VBAN_SERVICE_RTPACKETREGISTER = 32
 VBAN_SERVICE_RTPACKET = 33
 
+# Tape recorder routing buttons shown in header.
+RECORDER_ROUTING_BUSES = ("A1", "A2", "A3", "B1", "B2")
+
 # RT packet state bit masks
 VMRTSTATE_MODE_MUTE = 0x00000001
 VMRTSTATE_MODE_BUSA1 = 0x00001000
@@ -39,6 +43,14 @@ VMRTSTATE_MODE_BUSA5 = 0x00080000
 VMRTSTATE_MODE_BUSB1 = 0x00010000
 VMRTSTATE_MODE_BUSB2 = 0x00020000
 VMRTSTATE_MODE_BUSB3 = 0x00040000
+
+# RT packet transport bits
+TRANSPORTBIT_PLAY = 0x00000001
+TRANSPORTBIT_STOP = 0x00000002
+TRANSPORTBIT_RECORD = 0x00000004
+TRANSPORTBIT_PAUSE = 0x00000008
+TRANSPORTBIT_REWIND = 0x00000010
+TRANSPORTBIT_FORWARD = 0x00000020
 
 ROUTING_STATE_BITS = {
     "A1": VMRTSTATE_MODE_BUSA1,
@@ -93,6 +105,9 @@ BG_COLOR = "#2d2d2d"  # Main background - lighter black/dark gray
 BG_DARKER = "#252525"  # Slightly darker for contrast
 LOGO_SCALE = 5
 LOGO_MAX_HEIGHT_RATIO = 0.175
+GATE_DB_MIN = -60.0
+GATE_DB_MAX = -20.0
+GATE_DB_CURVE = 2.5
 
 CONFIG_FILE = Path.home() / ".config" / "voicemeeter-deck" / "config.json"
 
@@ -101,6 +116,7 @@ DEFAULT_CONFIG = {
     "port": 6980,
     "stream_name": "Command1",
     "mixer_type": "auto",
+    "last_detected_type": "banana",
     "strips": {},
     "buses": {},
     "recorder": {"play": False, "record": False, "pause": False}
@@ -230,18 +246,24 @@ class VBANSender:
     def recorder_goto_start(self):
         self.send_command("Recorder.GoTo=0;")
 
-    def register_rt_packet(self, timeout: int = 15, stream_name: str = "VMDeckLinux", source_socket=None):
+    def set_recorder_bus(self, bus: str, enabled: bool):
+        bus = bus.upper()
+        self.send_command(f"Recorder.{bus}={1 if enabled else 0};")
+
+    def register_rt_packet(self, timeout: int = 15, stream_name: str = "Register RTP",
+                           source_socket=None, format_nbs: int = 0):
         """Register for RT-Packet updates (must be called periodically every ~10s).
 
         Pass the listener socket so Voicemeeter replies to the correct UDP port.
+        format_nbs: 0 = RT packet, 1 = parameter strip packet.
         """
         try:
             header = bytearray(28)
             header[0:4] = b"VBAN"
             # format_SR (byte 4): Contains protocol (0x60) + sample rate bits
             header[4] = VBAN_PROTOCOL_SERVICE  # 0x60
-            # format_nbs (byte 5): Number of samples (0 for service packets)
-            header[5] = 0
+            # format_nbs (byte 5): Number of samples (service packet selector)
+            header[5] = format_nbs & 0xFF
             # format_nbc (byte 6): Number of channels minus 1, OR in service context: service type
             header[6] = VBAN_SERVICE_RTPACKETREGISTER  # 32
             # format_bit (byte 7): Bit depth (audio) OR timeout (service packets)
@@ -262,7 +284,7 @@ class VBANSender:
             packet = bytes(header)
             send_socket = source_socket or self.socket
             send_socket.sendto(packet, (self.ip, self.port))
-            print(f"[VBAN] Sent RT-Packet registration (timeout={timeout}s)")
+            print(f"[VBAN] Sent RT-Packet registration (timeout={timeout}s, format_nbs={format_nbs})")
             return True
         except Exception as e:
             print(f"[VBAN] Error registering RT packet: {e}")
@@ -285,6 +307,23 @@ class VBANRTPacketListener:
         self.output_levels = [0] * 64
         self.strip_states = [0] * 8
         self.bus_states = [0] * 8
+        self.transport_bits = 0
+        self.strip_labels = [""] * 8
+        self.bus_labels = [""] * 8
+        self.strip_gains = []
+        self.bus_gains = []
+        self.strip_eq_gains = []
+        self.strip_gate_values = []
+        self.strip_param_gains = []
+        self._debug_logged = set()
+        self._last_gain_log = 0.0
+        self._last_param_log = 0.0
+        self._last_strip_gains = None
+        self._last_bus_gains = None
+        self._last_param_gains = None
+        self._last_strip0_layers = None
+        self._last_transport_bits = None
+        self._last_gate0_value = None
 
     def start(self):
         """Start listening thread"""
@@ -314,6 +353,24 @@ class VBANRTPacketListener:
         if self.socket:
             self.socket.close()
 
+    def _debug_log(self, message: str, key: str = None):
+        if key:
+            if key in self._debug_logged:
+                return
+            self._debug_logged.add(key)
+        try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            log_path = CONFIG_FILE.parent / "rt_debug.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{timestamp}] {message}\n")
+        except Exception:
+            pass
+        print(f"[RT-Listener] {message}")
+
+    def _debug_once(self, key: str, message: str):
+        self._debug_log(message, key=key)
+
     def _listen_thread(self):
         """Background thread to receive RT packets"""
         packet_count = 0
@@ -332,12 +389,18 @@ class VBANRTPacketListener:
                     # Check VBAN header
                     if data[0:4] == b"VBAN":
                         protocol = data[4] & 0xE0
+                        format_nbs = data[5]
                         service_type = data[6]
 
                         if protocol == VBAN_PROTOCOL_SERVICE and service_type == VBAN_SERVICE_RTPACKET:
                             if packet_count == 1:
                                 print(f"[RT-Listener] First RT packet validated! Protocol={hex(protocol)}, Service={service_type}")
-                            self._parse_rt_packet(data[28:])  # Skip 28-byte header
+                            if packet_count <= 3:
+                                self._debug_once("rt_service", f"service packet len={len(data)} format_nbs={format_nbs}")
+                            if format_nbs == 1:
+                                self._parse_param_strip_packet(data[28:])  # Skip 28-byte header
+                            else:
+                                self._parse_rt_packet(data[28:])  # Skip 28-byte header
                         elif packet_count <= 3:
                             print(f"[RT-Listener] Packet {packet_count}: Wrong type - protocol={hex(protocol)}, service={service_type}")
                     elif packet_count <= 3:
@@ -356,6 +419,7 @@ class VBANRTPacketListener:
                     print(f"[RT-Listener] Warning: Packet too small ({len(data)} bytes, need 212+)")
                     self._warned_size = True
                 return
+            self._debug_once("rt_len", f"rt_packet_len={len(data)}")
 
             # Skip first 16 bytes (voicemeeterType, reserved, buffersize, version, optionBits, samplerate)
             vm_type = data[0]
@@ -371,12 +435,60 @@ class VBANRTPacketListener:
 
             strip_states = None
             bus_states = None
+            strip_gains = None
+            bus_gains = None
+            transport_bits = None
+            strip_labels = None
+            bus_labels = None
             if len(data) >= offset + 4 + 32 + 32:
-                _ = struct.unpack_from("<I", data, offset)[0]
+                transport_bits = struct.unpack_from("<I", data, offset)[0]      
                 offset += 4
                 strip_states = struct.unpack_from("<8I", data, offset)
                 offset += 32
                 bus_states = struct.unpack_from("<8I", data, offset)
+                offset += 32
+
+                gains_bytes = (8 * 8 * 2) + (8 * 2)
+                if len(data) >= offset + gains_bytes:
+                    strip_gain_layers = []
+                    for _ in range(8):
+                        strip_gain_layers.append(struct.unpack_from("<8h", data, offset))
+                        offset += 16
+                    bus_gains = struct.unpack_from("<8h", data, offset)
+                    strip_gains = []
+                    for index in range(8):
+                        layer_values = [layer[index] * 0.01 for layer in strip_gain_layers]
+                        non_zero = [value for value in layer_values if abs(value) > 0.001]
+                        if not non_zero:
+                            strip_gains.append(0.0)
+                        else:
+                            positives = [value for value in non_zero if value > 0]
+                            if positives:
+                                strip_gains.append(max(positives))
+                            else:
+                                strip_gains.append(min(non_zero))
+                    strip0_layers = [layer[0] * 0.01 for layer in strip_gain_layers]
+                    if strip0_layers != self._last_strip0_layers:
+                        self._last_strip0_layers = strip0_layers
+                        self._debug_log(f"rt_strip0_layers={strip0_layers}", key=None)
+                    self._debug_once("rt_gains", "rt_packet_gains=1")
+                else:
+                    self._debug_once("rt_no_gains", f"rt_packet_missing_gains len={len(data)}")
+
+            label_bytes = 8 * 60
+            if len(data) >= offset + (label_bytes * 2):
+                strip_labels = []
+                for _ in range(8):
+                    raw = data[offset:offset + 60]
+                    text = raw.split(b"\x00", 1)[0].decode("utf-8", "ignore").strip()
+                    strip_labels.append(text)
+                    offset += 60
+                bus_labels = []
+                for _ in range(8):
+                    raw = data[offset:offset + 60]
+                    text = raw.split(b"\x00", 1)[0].decode("utf-8", "ignore").strip()
+                    bus_labels.append(text)
+                    offset += 60
 
             # Update with lock
             with self.lock:
@@ -387,6 +499,21 @@ class VBANRTPacketListener:
                     self.strip_states = list(strip_states)
                 if bus_states is not None:
                     self.bus_states = list(bus_states)
+                if strip_gains is not None:
+                    self.strip_gains = list(strip_gains)
+                if bus_gains is not None:
+                    self.bus_gains = [gain * 0.01 for gain in bus_gains]        
+                if transport_bits is not None:
+                    self.transport_bits = transport_bits
+                if strip_labels is not None:
+                    self.strip_labels = list(strip_labels)
+                if bus_labels is not None:
+                    self.bus_labels = list(bus_labels)
+            if strip_gains is not None:
+                self._log_gain_snapshot(strip_gains, bus_gains)
+            if transport_bits is not None and transport_bits != self._last_transport_bits:
+                self._last_transport_bits = transport_bits
+                self._debug_log(f"transport_bits=0x{transport_bits:08X}", key=None)
 
             # Debug: Print first 5 input and output levels (once every 50 packets)
             if not hasattr(self, '_debug_counter'):
@@ -399,6 +526,91 @@ class VBANRTPacketListener:
 
         except Exception as e:
             print(f"Error parsing RT packet: {e}")
+
+    def _parse_param_strip_packet(self, data):
+        """Parse VBAN parameter strip packet for knob values."""
+        try:
+            if len(data) < 16:
+                if not hasattr(self, '_warned_param_size'):
+                    print(f"[RT-Listener] Warning: Param packet too small ({len(data)} bytes)")
+                    self._warned_param_size = True
+                return
+
+            vm_type = data[0]
+            header_size = 16
+            strip_block = (len(data) - header_size) // 8
+            if strip_block < 24:
+                if not hasattr(self, '_warned_param_block'):
+                    print(f"[RT-Listener] Warning: Param strip size too small ({strip_block} bytes)")
+                    self._warned_param_block = True
+                return
+
+            eq_gains = []
+            gate_values = []
+            param_gains = []
+            for index in range(8):
+                base = header_size + (index * strip_block)
+                if base + 24 > len(data):
+                    break
+                dblevel = struct.unpack_from("<f", data, base + 4)[0] * 0.01
+                param_gains.append(dblevel)
+                eq1, eq2, eq3 = struct.unpack_from("<3h", data, base + 18)
+                eq_gains.append((eq1 * 0.01, eq2 * 0.01, eq3 * 0.01))
+
+                gate_value = None
+                gate_offset = base + 148
+                if strip_block >= 150 and gate_offset + 2 <= len(data):
+                    gate_value = struct.unpack_from("<h", data, gate_offset)[0] * 0.01
+                gate_values.append(gate_value)
+
+            while len(eq_gains) < 8:
+                eq_gains.append(None)
+            while len(gate_values) < 8:
+                gate_values.append(None)
+            while len(param_gains) < 8:
+                param_gains.append(None)
+
+            with self.lock:
+                self.voicemeeter_type = vm_type
+                self.strip_eq_gains = list(eq_gains)
+                self.strip_gate_values = list(gate_values)
+                self.strip_param_gains = list(param_gains)
+            self._debug_once("param_packet", f"param_packet_len={len(data)} strip_block={strip_block}")
+            self._log_param_snapshot(eq_gains, gate_values, param_gains)
+        except Exception as e:
+            print(f"Error parsing param strip packet: {e}")
+
+    def _log_gain_snapshot(self, strip_gains, bus_gains):
+        if strip_gains is None:
+            return
+        strip_list = [round(value, 2) for value in strip_gains]
+        bus_list = []
+        if bus_gains:
+            bus_list = [round(value * 0.01, 2) for value in bus_gains]
+        if strip_list == self._last_strip_gains and bus_list == self._last_bus_gains:
+            return
+        self._last_strip_gains = strip_list
+        self._last_bus_gains = bus_list
+        self._debug_log(f"rt_gains strip={strip_list} bus={bus_list}", key=None)
+
+    def _log_param_snapshot(self, eq_gains, gate_values, param_gains):
+        if param_gains is None:
+            return
+        param_list = [None if value is None else round(value, 2) for value in param_gains]
+        if param_list == self._last_param_gains:
+            pass
+        else:
+            self._last_param_gains = param_list
+            eq0 = eq_gains[0] if eq_gains else None
+            gate0 = gate_values[0] if gate_values else None
+            self._debug_log(f"param_gains strip={param_list} eq0={eq0} gate0={gate0}", key=None)
+
+        gate0 = gate_values[0] if gate_values else None
+        if gate0 is not None:
+            gate0 = round(gate0, 2)
+            if self._last_gate0_value is None or abs(gate0 - self._last_gate0_value) >= 0.05:
+                self._last_gate0_value = gate0
+                self._debug_log(f"gate0_change={gate0}", key=None)
 
     def get_input_level(self, index: int) -> float:
         """Get input level in dB for given strip index"""
@@ -424,6 +636,52 @@ class VBANRTPacketListener:
         with self.lock:
             if 0 <= index < len(self.bus_states):
                 return self.bus_states[index]
+        return None
+
+    def get_transport_bits(self):
+        with self.lock:
+            return self.transport_bits
+
+    def get_strip_label(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_labels):
+                return self.strip_labels[index]
+        return ""
+
+    def get_bus_label(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.bus_labels):
+                return self.bus_labels[index]
+        return ""
+
+    def get_strip_gain(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_gains):
+                return self.strip_gains[index]
+        return None
+
+    def get_bus_gain(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.bus_gains):
+                return self.bus_gains[index]
+        return None
+
+    def get_strip_eq(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_eq_gains):
+                return self.strip_eq_gains[index]
+        return None
+
+    def get_strip_gate(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_gate_values):
+                return self.strip_gate_values[index]
+        return None
+
+    def get_strip_param_gain(self, index: int):
+        with self.lock:
+            if 0 <= index < len(self.strip_param_gains):
+                return self.strip_param_gains[index]
         return None
 
     def _strip_channel_range(self, index: int):
@@ -466,6 +724,7 @@ class CustomSlider(tk.Canvas):
         self.on_change = on_change
         self.value = 0
         self.input_blocked = False
+        self.last_user_interaction = 0.0
         self.min_height = 120
         self.base_height = height
 
@@ -525,6 +784,7 @@ class CustomSlider(tk.Canvas):
             self._update_from_y(event.y)
 
     def _on_double_click(self, event):
+        self._mark_user_interaction()
         self.set_value(0)
         if self.on_change:
             self.on_change(0)
@@ -535,6 +795,7 @@ class CustomSlider(tk.Canvas):
         self.input_blocked = False
 
     def _update_from_y(self, y):
+        self._mark_user_interaction()
         self.value = self._y_to_value(y)
         handle_y = self._value_to_y(self.value)
 
@@ -553,6 +814,7 @@ class CustomSlider(tk.Canvas):
 
     def set_value(self, value):
         """Set slider value programmatically"""
+        value = max(self.to_val, min(self.from_val, value))
         self.value = value
         handle_y = self._value_to_y(value)
         self.coords(
@@ -585,12 +847,16 @@ class CustomSlider(tk.Canvas):
 
     def _adjust_value(self, direction):
         """Adjust value by step in given direction (up=increase dB, down=decrease dB)"""
+        self._mark_user_interaction()
         step = 2  # 2 dB per scroll step
         new_val = self.value + (direction * step)
         new_val = max(self.to_val, min(self.from_val, new_val))  # Clamp to range
         self.set_value(new_val)
         if self.on_change:
             self.on_change(new_val)
+
+    def _mark_user_interaction(self):
+        self.last_user_interaction = time.monotonic()
 
     def _on_resize(self, event):
         """Handle resize events"""
@@ -703,6 +969,7 @@ class Knob(tk.Canvas):
         self.dragging = False
         self.drag_start_y = 0
         self.drag_start_value = 0
+        self.last_user_interaction = 0.0
 
         self._draw_knob()
 
@@ -766,6 +1033,7 @@ class Knob(tk.Canvas):
 
     def _on_drag(self, event):
         if self.dragging:
+            self._mark_user_interaction()
             # Moving up increases value, moving down decreases
             delta = self.drag_start_y - event.y_root  # Use root coords
             range_val = self.to_val - self.from_val
@@ -800,6 +1068,7 @@ class Knob(tk.Canvas):
 
     def _adjust_value(self, direction):
         """Adjust value by one step in the given direction"""
+        self._mark_user_interaction()
         range_val = self.to_val - self.from_val
         # Step size: roughly 5% of range, minimum 1
         step = max(1, abs(range_val) // 20)
@@ -838,6 +1107,7 @@ class Knob(tk.Canvas):
         self._update_indicator()
 
     def set_value(self, value):
+        value = max(self.from_val, min(self.to_val, value))
         self.value = value
         self._update_display()
 
@@ -848,6 +1118,9 @@ class Knob(tk.Canvas):
         self.size = new_size
         self.config(width=new_size, height=new_size + 12)
         self._draw_knob()
+
+    def _mark_user_interaction(self):
+        self.last_user_interaction = time.monotonic()
 
 
 class RoutingButton(tk.Button):
@@ -901,6 +1174,8 @@ class RoutingButton(tk.Button):
 
 class ChannelStrip(tk.Frame):
     """A single channel strip with slider, routing buttons, and mute"""
+    _gate_calibration_points = None
+    _gate_calibration_max_points = 10
 
     def __init__(self, parent, label: str, index: int, vban: VBANSender, is_strip=True,
                  initial_state: dict = None, show_gate=False, show_eq=False, rt_listener=None, routing_buses=None):
@@ -913,6 +1188,10 @@ class ChannelStrip(tk.Frame):
         self.label_text = label
         self.rt_listener = rt_listener
         self.routing_buttons = {}
+        self._gate_last_sent = None
+        self._gate_last_sent_at = 0.0
+        self._gate_last_sent_pending = False
+        self._gate_value_at_send = None
 
         state = initial_state or {}
         self.muted = state.get("muted", False)
@@ -920,6 +1199,8 @@ class ChannelStrip(tk.Frame):
         # Label
         self.label = tk.Label(self, text=label, font=("", 11, "bold"),
                               bg=BG_COLOR, fg="white")
+        if not self.is_strip:
+            self.label.configure(wraplength=70, justify="center")
         self.label.pack(pady=(5, 3))
 
         # Gate knob (for HW inputs)
@@ -928,7 +1209,7 @@ class ChannelStrip(tk.Frame):
             self.gate_knob = Knob(
                 self, "GATE",
                 from_val=0, to_val=10,
-                on_change=lambda v, i=idx: vban.set_strip_gate(i, v),
+                on_change=self._on_gate_change,
                 color="#FF9800",
                 size=40
             )
@@ -1037,6 +1318,16 @@ class ChannelStrip(tk.Frame):
         else:
             self.vban.set_bus_gain(self.index, gain)
 
+    def _on_gate_change(self, value):
+        self._gate_last_sent = value
+        self._gate_last_sent_at = time.monotonic()
+        self._gate_last_sent_pending = True
+        if self.rt_listener:
+            self._gate_value_at_send = self.rt_listener.get_strip_gate(self.index)
+        else:
+            self._gate_value_at_send = None
+        self.vban.set_strip_gate(self.index, value)
+
     def _on_mute_click(self):
         self.muted = not self.muted
         self._update_mute_appearance()
@@ -1075,6 +1366,134 @@ class ChannelStrip(tk.Frame):
             if state is None:
                 return
             self.set_mute_state(bool(state & VMRTSTATE_MODE_MUTE))
+            self._sync_bus_label_from_rt()
+        self._sync_gain_from_rt()
+        self._sync_knobs_from_rt()
+
+    def _sync_bus_label_from_rt(self):
+        if self.is_strip or not self.rt_listener:
+            return
+        bus_label = self.rt_listener.get_bus_label(self.index)
+        if not bus_label:
+            display = self.label_text
+        else:
+            if bus_label.strip().lower() == self.label_text.strip().lower():
+                display = self.label_text
+            else:
+                display = f"{self.label_text}\n{bus_label}"
+        if self.label.cget("text") != display:
+            self.label.config(text=display)
+
+    def _recent_user_interaction(self, control, window=0.35):
+        last = getattr(control, "last_user_interaction", 0.0)
+        return last and (time.monotonic() - last) < window
+
+    def _sync_gain_from_rt(self):
+        if not self.slider or self._recent_user_interaction(self.slider):
+            return
+        if self.is_strip:
+            gain = self.rt_listener.get_strip_gain(self.index)
+            if gain is None:
+                gain = self.rt_listener.get_strip_param_gain(self.index)
+        else:
+            gain = self.rt_listener.get_bus_gain(self.index)
+        if gain is None:
+            return
+        self.slider.set_value(round(gain))
+
+    def _sync_knob_value(self, knob, value):
+        if knob is None or value is None:
+            return
+        if self._recent_user_interaction(knob):
+            return
+        if value < knob.from_val or value > knob.to_val:
+            return
+        knob.set_value(round(value))
+
+    @classmethod
+    def _init_gate_calibration(cls):
+        if cls._gate_calibration_points is None:
+            cls._gate_calibration_points = [
+                {"db": GATE_DB_MIN, "knob": 0.0, "fixed": True, "ts": 0.0},
+                {"db": GATE_DB_MAX, "knob": 10.0, "fixed": True, "ts": 0.0},
+            ]
+
+    @classmethod
+    def _add_gate_calibration_point(cls, db_value, knob_value):
+        if db_value is None or knob_value is None:
+            return
+        cls._init_gate_calibration()
+        db_value = max(GATE_DB_MIN, min(GATE_DB_MAX, float(db_value)))
+        knob_value = max(0.0, min(10.0, float(knob_value)))
+        now = time.monotonic()
+        for point in cls._gate_calibration_points:
+            if point.get("fixed"):
+                continue
+            if abs(point["db"] - db_value) <= 0.5:
+                point["knob"] = knob_value
+                point["ts"] = now
+                return
+        cls._gate_calibration_points.append({
+            "db": db_value,
+            "knob": knob_value,
+            "fixed": False,
+            "ts": now,
+        })
+        dynamic = [p for p in cls._gate_calibration_points if not p.get("fixed")]
+        if len(dynamic) > cls._gate_calibration_max_points:
+            oldest = min(dynamic, key=lambda p: p.get("ts", 0.0))
+            cls._gate_calibration_points.remove(oldest)
+
+    @classmethod
+    def _map_gate_db_to_knob(cls, db_value):
+        if db_value is None:
+            return None
+        cls._init_gate_calibration()
+        points = sorted(cls._gate_calibration_points, key=lambda p: p["db"])
+        if len(points) <= 2:
+            db_value = max(GATE_DB_MIN, min(GATE_DB_MAX, db_value))
+            normalized = (db_value - GATE_DB_MIN) / (GATE_DB_MAX - GATE_DB_MIN)
+            if normalized <= 0.0:
+                return 0.0
+            if normalized >= 1.0:
+                return 10.0
+            curve = 1.0 + (GATE_DB_CURVE * (1.0 - normalized) ** 2)
+            return (normalized ** curve) * 10.0
+        db_value = max(points[0]["db"], min(points[-1]["db"], db_value))
+        for idx in range(1, len(points)):
+            if db_value <= points[idx]["db"]:
+                lo = points[idx - 1]
+                hi = points[idx]
+                if hi["db"] == lo["db"]:
+                    return hi["knob"]
+                ratio = (db_value - lo["db"]) / (hi["db"] - lo["db"])
+                return lo["knob"] + (hi["knob"] - lo["knob"]) * ratio
+        return points[-1]["knob"]
+
+    def _sync_knobs_from_rt(self):
+        if not self.is_strip:
+            return
+        if self.show_gate and hasattr(self, "gate_knob"):
+            gate_value = self.rt_listener.get_strip_gate(self.index)
+            now = time.monotonic()
+            if self._gate_last_sent_pending and (now - self._gate_last_sent_at) >= 5.0:
+                self._gate_last_sent_pending = False
+            if (gate_value is not None and self._gate_last_sent_pending and
+                    (now - self._gate_last_sent_at) >= 0.2):
+                baseline = self._gate_value_at_send
+                if baseline is None or abs(gate_value - baseline) >= 0.1:
+                    self._add_gate_calibration_point(gate_value, self._gate_last_sent)
+                    self._gate_last_sent_pending = False
+            mapped_gate = self._map_gate_db_to_knob(gate_value)
+            self._sync_knob_value(self.gate_knob, mapped_gate)
+        if self.show_eq and hasattr(self, "eq_bass"):
+            eq_values = self.rt_listener.get_strip_eq(self.index)
+            if not eq_values:
+                return
+            bass, mid, treble = eq_values
+            self._sync_knob_value(self.eq_bass, bass)
+            self._sync_knob_value(self.eq_mid, mid)
+            self._sync_knob_value(self.eq_treble, treble)
 
     def _update_meter(self):
         """Update VU meter with current level from RT listener"""
@@ -1130,14 +1549,23 @@ class ChannelStrip(tk.Frame):
 class TapeRecorder(tk.Frame):
     """Tape recorder control panel matching Voicemeeter layout: <<, >>, |>, [], O"""
 
-    def __init__(self, parent, vban: VBANSender):
+    def __init__(self, parent, vban: VBANSender, rt_listener=None, routing_buses=None):
         super().__init__(parent, bg=BG_COLOR)
         self.vban = vban
+        self.rt_listener = rt_listener
+        self._btn_defaults = {}
+        self._transport_state = {}
+        self.routing_buttons = {}
+        self.routing_buses = []
+        self._routing_reset_done = False
+        self._routing_reset_after_id = None
 
         btn_size = 28  # Fixed pixel size for all buttons
+        btn_row = tk.Frame(self, bg=BG_COLOR)
+        btn_row.pack(fill=tk.X)
 
         def make_btn(text, command, fg="white"):
-            frame = tk.Frame(self, width=btn_size, height=btn_size, bg="#444")
+            frame = tk.Frame(btn_row, width=btn_size, height=btn_size, bg="#444")
             frame.pack_propagate(False)
             frame.pack(side=tk.LEFT, padx=1)
             btn = tk.Button(
@@ -1146,6 +1574,11 @@ class TapeRecorder(tk.Frame):
                 relief=tk.RAISED, command=command
             )
             btn.pack(expand=True, fill=tk.BOTH)
+            self._btn_defaults[btn] = {
+                "bg": btn.cget("bg"),
+                "relief": btn.cget("relief"),
+                "fg": btn.cget("fg"),
+            }
             return btn
 
         # Rewind <<
@@ -1159,6 +1592,118 @@ class TapeRecorder(tk.Frame):
         # Record O (red)
         self.record_btn = make_btn("●", vban.recorder_record, fg="#d32f2f")
 
+        # Recorder routing buttons (A1..B2)
+        self.route_row = tk.Frame(self, bg=BG_COLOR)
+        self.route_row.pack(fill=tk.X, pady=(4, 0))
+        self._set_routing_buses(routing_buses)
+        self._schedule_routing_reset()
+
+        if self.rt_listener:
+            self._update_display()
+
+    def _normalize_routing_buses(self, routing_buses):
+        if not routing_buses:
+            routing_buses = list(RECORDER_ROUTING_BUSES)
+        normalized = []
+        for item in routing_buses:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                normalized.append((item[0], item[1]))
+            else:
+                normalized.append((item, item))
+        return normalized
+
+    def _set_routing_buses(self, routing_buses):
+        self.routing_buses = self._normalize_routing_buses(routing_buses)
+        for child in self.route_row.winfo_children():
+            child.destroy()
+        self.routing_buttons = {}
+        for bus_key, label in self.routing_buses:
+            btn = RoutingButton(
+                self.route_row,
+                label,
+                lambda on, b=bus_key: self.vban.set_recorder_bus(b, on),
+                False,
+                width=3
+            )
+            btn.pack(side=tk.LEFT, padx=1)
+            self.routing_buttons[bus_key] = btn
+
+    def update_routing_buses(self, routing_buses):
+        self._set_routing_buses(routing_buses)
+        self._schedule_routing_reset()
+
+    def _schedule_routing_reset(self):
+        if not self.routing_buttons:
+            return
+        self._routing_reset_done = False
+        if self._routing_reset_after_id:
+            try:
+                self.after_cancel(self._routing_reset_after_id)
+            except Exception:
+                pass
+        self._routing_reset_after_id = self.after(400, self._reset_routing_buttons)
+
+    def _reset_routing_buttons(self):
+        if self._routing_reset_done or not self.winfo_exists():
+            return
+        self._routing_reset_done = True
+        for bus_key, _label in self.routing_buses:
+            self.vban.set_recorder_bus(bus_key, True)
+            btn = self.routing_buttons.get(bus_key)
+            if btn:
+                btn.set_state(True)
+        self.after(200, self._reset_routing_buttons_off)
+
+    def _reset_routing_buttons_off(self):
+        if not self.winfo_exists():
+            return
+        for bus_key, _label in self.routing_buses:
+            self.vban.set_recorder_bus(bus_key, False)
+            btn = self.routing_buttons.get(bus_key)
+            if btn:
+                btn.set_state(False)
+
+    def _set_button_active(self, button, active, active_bg="#666"):
+        defaults = self._btn_defaults.get(button, {})
+        if active:
+            button.configure(relief=tk.SUNKEN, bg=active_bg)
+            return
+        button.configure(
+            relief=defaults.get("relief", tk.RAISED),
+            bg=defaults.get("bg", "#444"),
+            fg=defaults.get("fg", "white"),
+        )
+
+    def _decode_transport(self, transport_bits: int) -> dict:
+        state = {
+            "play": bool(transport_bits & TRANSPORTBIT_PLAY),
+            "stop": bool(transport_bits & TRANSPORTBIT_STOP),
+            "record": bool(transport_bits & TRANSPORTBIT_RECORD),
+            "pause": bool(transport_bits & TRANSPORTBIT_PAUSE),
+            "rewind": bool(transport_bits & TRANSPORTBIT_REWIND),
+            "forward": bool(transport_bits & TRANSPORTBIT_FORWARD),
+        }
+        if not any(state.values()):
+            state["stop"] = True
+        return state
+
+    def _apply_transport_state(self, state: dict):
+        self._set_button_active(self.play_btn, state.get("play", False), "#2e7d32")
+        self._set_button_active(self.stop_btn, state.get("stop", False), "#666")
+        self._set_button_active(self.record_btn, state.get("record", False), "#b71c1c")
+        self._set_button_active(self.rewind_btn, state.get("rewind", False), "#455a64")
+        self._set_button_active(self.ff_btn, state.get("forward", False), "#455a64")
+
+    def _update_display(self):
+        transport_bits = 0
+        if self.rt_listener:
+            transport_bits = self.rt_listener.get_transport_bits()
+        state = self._decode_transport(transport_bits)
+        if state != self._transport_state:
+            self._transport_state = state
+            self._apply_transport_state(state)
+        self.after(100, self._update_display)
+
 
 class SettingsDialog(tk.Toplevel):
     """Settings dialog"""
@@ -1167,7 +1712,7 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.on_save = on_save
         self.title("Settings")
-        self.geometry("400x310")
+        self.geometry("400x240")
         self.resizable(False, False)
         self.configure(bg=BG_COLOR)
 
@@ -1192,18 +1737,6 @@ class SettingsDialog(tk.Toplevel):
         self.stream_entry.insert(0, config["stream_name"])
         self.stream_entry.pack()
 
-        tk.Label(self, text="Mixer Type:", font=("", 12),
-                 bg=BG_COLOR, fg="white").pack(pady=(10, 5))
-        self.mixer_var = tk.StringVar(value=config.get("mixer_type", "banana"))
-        self.mixer_combo = ttk.Combobox(
-            self,
-            textvariable=self.mixer_var,
-            values=["auto", "standard", "banana", "potato"],
-            state="readonly",
-            width=18
-        )
-        self.mixer_combo.pack()
-
         tk.Button(
             self,
             text="Save",
@@ -1221,7 +1754,7 @@ class SettingsDialog(tk.Toplevel):
             "pc_ip": self.ip_entry.get(),
             "port": int(self.port_entry.get()),
             "stream_name": self.stream_entry.get(),
-            "mixer_type": self.mixer_var.get()
+            "mixer_type": "auto"
         }
         self.on_save(config)
         self.destroy()
@@ -1235,7 +1768,8 @@ class VoicemeeterDeckApp:
 
     def __init__(self):
         self.config = self._load_config()
-        self.mixer_type_setting = self.config.get("mixer_type", "auto")
+        self.config["mixer_type"] = "auto"
+        self.mixer_type_setting = "auto"
         self.active_mixer_type = self._resolve_mixer_type(self.mixer_type_setting)
         self.mixer_profile = MIXER_PROFILES[self.active_mixer_type]
         self.base_width, self.base_height = self._calculate_base_size(self.mixer_profile)
@@ -1257,6 +1791,10 @@ class VoicemeeterDeckApp:
         self.root.minsize(800, 350)  # Minimum window size
         self.root.configure(bg=BG_COLOR)
 
+        self._auto_detect_after_id = None
+        self._restart_pending = False
+        self._pending_restart_type = None
+
         # Track last size for resize handling
         self.last_width = self.base_width
         self.last_height = self.base_height
@@ -1267,8 +1805,7 @@ class VoicemeeterDeckApp:
 
         self._create_ui()
 
-        if self.mixer_type_setting == "auto":
-            self._auto_detect_mixer_type()
+        self._start_auto_detect()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1329,9 +1866,9 @@ class VoicemeeterDeckApp:
 
     def _save_config(self, config: dict):
         try:
-            previous_type = self.mixer_type_setting
             config["strips"] = self.config.get("strips", {})
             config["buses"] = self.config.get("buses", {})
+            config["mixer_type"] = "auto"
 
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, "w") as f:
@@ -1342,12 +1879,8 @@ class VoicemeeterDeckApp:
                 config["port"],
                 config["stream_name"]
             )
-            self.mixer_type_setting = config.get("mixer_type", "auto")
-            if self.mixer_type_setting != previous_type:
-                if self.mixer_type_setting == "auto":
-                    self._auto_detect_mixer_type()
-                else:
-                    self._apply_mixer_type(self.mixer_type_setting)
+            self.mixer_type_setting = "auto"
+            self._start_auto_detect()
             self._update_status_label()
             messagebox.showinfo("Settings", "Settings saved!")
         except Exception as e:
@@ -1358,6 +1891,9 @@ class VoicemeeterDeckApp:
             detected = self._detect_mixer_type()
             if detected:
                 return detected
+            last_detected = self.config.get("last_detected_type")
+            if last_detected in MIXER_PROFILES:
+                return last_detected
             return "banana"
         return mixer_type if mixer_type in MIXER_PROFILES else "banana"
 
@@ -1366,13 +1902,38 @@ class VoicemeeterDeckApp:
         vm_type = listener.voicemeeter_type if listener else None
         return VM_TYPE_TO_PROFILE.get(vm_type)
 
+    def _start_auto_detect(self):
+        if self._auto_detect_after_id is None:
+            self._auto_detect_after_id = self.root.after(500, self._auto_detect_mixer_type)
+
     def _auto_detect_mixer_type(self):
-        detected = self._detect_mixer_type()
-        if detected:
-            if detected != self.active_mixer_type:
-                self._apply_mixer_type(detected)
+        self._auto_detect_after_id = None
+        if self._restart_pending:
             return
-        self.root.after(500, self._auto_detect_mixer_type)
+        detected = self._detect_mixer_type()
+        if detected and detected != self.active_mixer_type:
+            self._schedule_restart(detected)
+            return
+        if detected and self.config.get("last_detected_type") != detected:
+            self.config["last_detected_type"] = detected
+        self._start_auto_detect()
+
+    def _schedule_restart(self, detected_type: str):
+        if self._restart_pending:
+            return
+        self._restart_pending = True
+        self._pending_restart_type = detected_type
+        print(f"[VM Remote] Mixer type changed to {detected_type}; restarting.")
+        self.root.after(250, self._restart_app)
+
+    def _restart_app(self):
+        if self._pending_restart_type:
+            self.config["last_detected_type"] = self._pending_restart_type
+        self._save_channel_states()
+        self.rt_listener.stop()
+        self.root.destroy()
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
 
     def _apply_mixer_type(self, mixer_type: str):
         if mixer_type not in MIXER_PROFILES:
@@ -1388,6 +1949,8 @@ class VoicemeeterDeckApp:
         if hasattr(self, "content"):
             self._clear_mixer_frames()
             self._build_mixer_frames()
+        self._update_recorder_routing_buses()
+        self._update_recorder_visibility()
         self._update_status_label()
 
     def _calculate_base_size(self, profile: dict):
@@ -1402,6 +1965,25 @@ class VoicemeeterDeckApp:
         if self.mixer_type_setting == "auto":
             mixer_label = f"auto -> {self.active_mixer_type}"
         self.status.config(text=f"Connected to {self.config['pc_ip']}:{self.config['port']} ({mixer_label})")
+
+    def _update_recorder_visibility(self):
+        if not hasattr(self, "recorder"):
+            return
+        if self.active_mixer_type == "standard":
+            self.recorder.pack_forget()
+            return
+        if not self.recorder.winfo_ismapped():
+            pack_opts = getattr(self, "recorder_pack_opts", {"side": tk.RIGHT, "padx": 20})
+            self.recorder.pack(**pack_opts)
+
+    def _get_recorder_routing_buses(self):
+        profile = self.mixer_profile
+        return list(profile.get("routing_buses", []))
+
+    def _update_recorder_routing_buses(self):
+        if not hasattr(self, "recorder"):
+            return
+        self.recorder.update_routing_buses(self._get_recorder_routing_buses())
 
     def _create_ui(self):
         # Header
@@ -1478,8 +2060,15 @@ class VoicemeeterDeckApp:
         settings_btn.pack(side=tk.RIGHT)
 
         # Tape recorder controls (right of title)
-        self.recorder = TapeRecorder(header, self.vban)
-        self.recorder.pack(side=tk.RIGHT, padx=20)
+        self.recorder = TapeRecorder(
+            header,
+            self.vban,
+            self.rt_listener,
+            routing_buses=self._get_recorder_routing_buses()
+        )
+        self.recorder_pack_opts = {"side": tk.RIGHT, "padx": 20}
+        self.recorder.pack(**self.recorder_pack_opts)
+        self._update_recorder_visibility()
 
         # Content
         self.content = tk.Frame(self.root, bg=BG_COLOR)
@@ -1498,6 +2087,9 @@ class VoicemeeterDeckApp:
         self._update_status_label()
 
     def _clear_mixer_frames(self):
+        if hasattr(self, "paned") and self.paned:
+            self.paned.destroy()
+            self.paned = None
         if hasattr(self, "strips_frame") and self.strips_frame:
             self.strips_frame.destroy()
         if hasattr(self, "buses_frame") and self.buses_frame:
@@ -1511,9 +2103,24 @@ class VoicemeeterDeckApp:
         routing_buses = profile["routing_buses"]
         hardware_strips = profile["hardware_strips"]
 
-        self.strips_frame = tk.LabelFrame(self.content, text=" Inputs ", font=("", 10),
+        self.paned = tk.PanedWindow(
+            self.content,
+            orient=tk.HORIZONTAL,
+            sashwidth=12,
+            sashrelief=tk.RIDGE,
+            sashpad=4,
+            showhandle=True,
+            handlesize=8,
+            handlepad=4,
+            sashcursor="sb_h_double_arrow",
+            cursor="sb_h_double_arrow",
+            bg=BG_DARKER,
+            bd=0
+        )
+        self.paned.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+
+        self.strips_frame = tk.LabelFrame(self.paned, text=" Inputs ", font=("", 10),
                                           bg=BG_COLOR, fg="white", bd=1)
-        self.strips_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
 
         strips_inner = tk.Frame(self.strips_frame, bg=BG_COLOR)
         strips_inner.pack(pady=5)
@@ -1522,7 +2129,7 @@ class VoicemeeterDeckApp:
         for i, label in enumerate(strip_labels):
             strip_state = self.config.get("strips", {}).get(str(i), None)
             # HW strips get Gate, virtual strips get EQ
-            show_gate = (i < hardware_strips)
+            show_gate = (i < hardware_strips) and (self.active_mixer_type != "standard")
             show_eq = (i >= hardware_strips)
             strip = ChannelStrip(strips_inner, label, i, self.vban, is_strip=True,
                                  initial_state=strip_state, show_gate=show_gate, show_eq=show_eq,
@@ -1530,9 +2137,8 @@ class VoicemeeterDeckApp:
             strip.pack(side=tk.LEFT, padx=3)
             self.strips.append(strip)
 
-        self.buses_frame = tk.LabelFrame(self.content, text=" Outputs ", font=("", 10),
+        self.buses_frame = tk.LabelFrame(self.paned, text=" Outputs ", font=("", 10),
                                          bg=BG_COLOR, fg="white", bd=1)
-        self.buses_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
 
         buses_inner = tk.Frame(self.buses_frame, bg=BG_COLOR)
         buses_inner.pack(pady=5)
@@ -1545,6 +2151,26 @@ class VoicemeeterDeckApp:
                                initial_state=bus_state, rt_listener=self.rt_listener)
             bus.pack(side=tk.LEFT, padx=3)
             self.buses.append(bus)
+
+        self.paned.add(self.strips_frame, minsize=240)
+        self.paned.add(self.buses_frame, minsize=240)
+        total_columns = max(1, len(strip_labels) + len(bus_labels))
+        split_ratio = (len(strip_labels) / total_columns) - 0.05
+        split_ratio = max(0.3, min(0.7, split_ratio))
+        self._set_splitter_position(split_ratio)
+
+    def _set_splitter_position(self, ratio):
+        if not hasattr(self, "paned") or not self.paned:
+            return
+        try:
+            width = self.paned.winfo_width()
+            if width <= 1:
+                self.root.after(50, lambda: self._set_splitter_position(ratio))
+                return
+            pos = int(width * ratio)
+            self.paned.sashpos(0, pos)
+        except Exception:
+            pass
 
     def _save_channel_states(self):
         strips = {}
@@ -1620,7 +2246,8 @@ class VoicemeeterDeckApp:
     def _periodic_rt_registration(self):
         """Re-register for RT packets every 10 seconds (as per SDK sample)"""
         try:
-            self.vban.register_rt_packet(timeout=15, source_socket=self.rt_listener.socket)
+            self.vban.register_rt_packet(timeout=15, source_socket=self.rt_listener.socket, format_nbs=0)
+            self.vban.register_rt_packet(timeout=15, source_socket=self.rt_listener.socket, format_nbs=1)
         except Exception as e:
             print(f"Error in periodic RT registration: {e}")
         # Schedule next registration in 10 seconds (10000ms)
