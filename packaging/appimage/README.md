@@ -8,6 +8,9 @@ Build (on Linux):
 2) `chmod +x build.sh AppRun`
 3) `./build.sh`
 
+Noob-friendly shortcut:
+- Run `./packaging/release_appimage.sh` from repo root.
+
 Output:
 - `packaging/appimage/dist/VM-Remote-<version>-<arch>.AppImage`
 
