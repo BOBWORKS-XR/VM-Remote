@@ -1,0 +1,35 @@
+pkgname=vm-remote-git
+pkgver=0.0.0.r0.g0000000
+pkgrel=1
+pkgdesc="VM Remote - Control Voicemeeter via VBAN"
+arch=('any')
+url="https://github.com/BOBWORKS-XR/VM-Remote"
+license=('custom')
+depends=('python' 'tk')
+source=("git+$url.git")
+md5sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/VM-Remote"
+  printf "0.0.0.r%s.g%s" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd "$srcdir/VM-Remote"
+  install -Dm755 linux-app/voicemeeter_deck.py \
+    "$pkgdir/usr/share/voicemeeter-deck/voicemeeter_deck.py"
+  install -Dm644 linux-app/logo.png \
+    "$pkgdir/usr/share/voicemeeter-deck/logo.png"
+  install -Dm644 linux-app/icon.png \
+    "$pkgdir/usr/share/voicemeeter-deck/icon.png"
+  install -Dm644 packaging/appimage/voicemeeter-deck.desktop \
+    "$pkgdir/usr/share/applications/voicemeeter-deck.desktop"
+  install -Dm644 linux-app/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/voicemeeter-deck.png"
+  install -Dm755 /dev/stdin "$pkgdir/usr/bin/voicemeeter-deck" <<'EOF'
+#!/usr/bin/env sh
+exec python /usr/share/voicemeeter-deck/voicemeeter_deck.py
+EOF
+}
