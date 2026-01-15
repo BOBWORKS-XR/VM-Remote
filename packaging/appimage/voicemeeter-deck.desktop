@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=VM Remote
+Comment=Control Voicemeeter via VBAN
+Exec=voicemeeter-deck
+Icon=voicemeeter-deck
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+StartupWMClass=voicemeeter-deck
