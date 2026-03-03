@@ -1225,7 +1225,7 @@ class ChannelStrip(tk.Frame):
             self.eq_bass = Knob(
                 eq_frame, "BASS",
                 from_val=-12, to_val=12,
-                on_change=lambda v, i=idx: vban.set_strip_eq_bass(i, v),
+                on_change=lambda v, i=idx: self._on_eq_change(i, "bass", v),
                 color="#e91e63",
                 size=40
             )
@@ -1235,7 +1235,7 @@ class ChannelStrip(tk.Frame):
             self.eq_mid = Knob(
                 eq_frame, "MID",
                 from_val=-12, to_val=12,
-                on_change=lambda v, i=idx: vban.set_strip_eq_mid(i, v),
+                on_change=lambda v, i=idx: self._on_eq_change(i, "mid", v),
                 color="#9C27B0",
                 size=40
             )
@@ -1245,7 +1245,7 @@ class ChannelStrip(tk.Frame):
             self.eq_treble = Knob(
                 eq_frame, "TREBLE",
                 from_val=-12, to_val=12,
-                on_change=lambda v, i=idx: vban.set_strip_eq_treble(i, v),
+                on_change=lambda v, i=idx: self._on_eq_change(i, "treble", v),
                 color="#3f51b5",
                 size=40
             )
@@ -1288,7 +1288,7 @@ class ChannelStrip(tk.Frame):
                 btn = RoutingButton(
                     routing_frame,
                     label_text,
-                    lambda on, i=idx, b=bus_key: vban.set_strip_bus(i, b, on),
+                    lambda on, i=idx, b=bus_key: self._on_routing_toggle(i, b, on),
                     state.get(state_key, default_on)
                 )
                 btn.pack(pady=1)
@@ -1317,6 +1317,17 @@ class ChannelStrip(tk.Frame):
             self.vban.set_strip_gain(self.index, gain)
         else:
             self.vban.set_bus_gain(self.index, gain)
+
+    def _on_eq_change(self, strip_index, band, value):
+        if band == "bass":
+            self.vban.set_strip_eq_bass(strip_index, value)
+        elif band == "mid":
+            self.vban.set_strip_eq_mid(strip_index, value)
+        elif band == "treble":
+            self.vban.set_strip_eq_treble(strip_index, value)
+
+    def _on_routing_toggle(self, strip_index, bus_key, enabled):
+        self.vban.set_strip_bus(strip_index, bus_key, enabled)
 
     def _on_gate_change(self, value):
         self._gate_last_sent = value
@@ -1712,7 +1723,7 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.on_save = on_save
         self.title("Settings")
-        self.geometry("400x240")
+        self.geometry("420x320")
         self.resizable(False, False)
         self.configure(bg=BG_COLOR)
 
@@ -1748,6 +1759,18 @@ class SettingsDialog(tk.Toplevel):
             bd=0,
             command=self._save
         ).pack(pady=15)
+
+        # Keep the Save action reachable even if theme scaling changes layout.
+        self.bind("<Return>", lambda _event: self._save())
+        self.bind("<Control-s>", lambda _event: self._save())
+
+        # Auto-fit to requested size so the Save button is never clipped off-screen.
+        self.update_idletasks()
+        req_w = self.winfo_reqwidth() + 24
+        req_h = self.winfo_reqheight() + 24
+        width = max(420, req_w)
+        height = max(300, req_h)
+        self.geometry(f"{width}x{height}")
 
     def _save(self):
         config = {
@@ -1864,6 +1887,32 @@ class VoicemeeterDeckApp:
     def _report_callback_exception(self, exc, val, tb):
         _log_exception(exc, val, tb)
 
+    def _set_vban_sender(self, sender: VBANSender):
+        old_sender = getattr(self, "vban", None)
+        self.vban = sender
+
+        if hasattr(self, "strips"):
+            for strip in self.strips:
+                strip.vban = sender
+        if hasattr(self, "buses"):
+            for bus in self.buses:
+                bus.vban = sender
+        if hasattr(self, "recorder"):
+            self.recorder.vban = sender
+            # Recorder transport buttons bind command callbacks at construction time.
+            # Rebind them so they target the current sender after settings changes.
+            self.recorder.rewind_btn.configure(command=sender.recorder_rewind)
+            self.recorder.ff_btn.configure(command=sender.recorder_forward)
+            self.recorder.play_btn.configure(command=sender.recorder_play)
+            self.recorder.stop_btn.configure(command=sender.recorder_stop)
+            self.recorder.record_btn.configure(command=sender.recorder_record)
+
+        if old_sender is not None and old_sender is not sender:
+            try:
+                old_sender.socket.close()
+            except Exception:
+                pass
+
     def _save_config(self, config: dict):
         try:
             config["strips"] = self.config.get("strips", {})
@@ -1874,11 +1923,12 @@ class VoicemeeterDeckApp:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=2)
             self.config = config
-            self.vban = VBANSender(
+            sender = VBANSender(
                 config["pc_ip"],
                 config["port"],
                 config["stream_name"]
             )
+            self._set_vban_sender(sender)
             self.mixer_type_setting = "auto"
             self._start_auto_detect()
             self._update_status_label()
